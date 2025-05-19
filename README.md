@@ -1,1 +1,1 @@
-# CRIS-systems-cleanup
+# Reconcile curation of DOI metadata in CRIS systems
