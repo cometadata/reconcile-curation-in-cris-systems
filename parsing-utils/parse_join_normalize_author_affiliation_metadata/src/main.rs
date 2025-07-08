@@ -12,30 +12,24 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-// Use lazy_static to compile regexes once at program start. This is a major
-// performance boost compared to compiling them inside a loop.
+
 lazy_static! {
     static ref AUTHOR_INDEX_RE: Regex = Regex::new(r"author\[(\d+)\]").unwrap();
     static ref AFFILIATION_INDEX_RE: Regex = Regex::new(r"affiliation\[(\d+)\]").unwrap();
     static ref NORMALIZE_RE: Regex = Regex::new(r"[^\w\s]").unwrap();
 }
 
-/// Command-line arguments parsed by Clap. The `short` attribute enables -i and -o.
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = "A memory-efficient Rust script to process and normalize author affiliation data from a large, sorted CSV file.")]
 struct Cli {
-    /// Path to the input CSV file. MUST be sorted by the 'doi' column.
     #[arg(short = 'i', long)]
     input: PathBuf,
 
-    /// Path for the output CSV file.
-    /// If not provided, defaults to <input_filename>_processed.csv
     #[arg(short = 'o', long)]
     output: Option<PathBuf>,
 }
 
-/// Represents a single row from the input CSV file.
-/// Deriving Deserialize allows `csv` crate to automatically convert rows into this struct.
+
 #[derive(Debug, Deserialize)]
 struct InputRecord {
     doi: String,
@@ -44,14 +38,12 @@ struct InputRecord {
     value: String,
 }
 
-/// Represents an author's affiliation with its sequence number.
 #[derive(Debug, Clone)]
 struct Affiliation {
     name: String,
     sequence: u32,
 }
 
-/// Aggregates all information related to a single author for a given DOI.
 #[derive(Debug, Default, Clone)]
 struct Author {
     given_name: Option<String>,
@@ -61,8 +53,6 @@ struct Author {
     sequence: u32,
 }
 
-/// Represents a single row in the final, processed output CSV file.
-/// Deriving Serialize allows `csv` crate to automatically write this struct to a file.
 #[derive(Debug, Serialize)]
 struct OutputRecord {
     doi: String,
@@ -73,14 +63,12 @@ struct OutputRecord {
     normalized_given_name: String,
     family_name: String,
     normalized_family_name: String,
-    affiliation_sequence: String, // Use String to allow for "None"
+    affiliation_sequence: String,
     affiliation: String,
     normalized_affiliation: String,
 }
 
-/// Normalizes a text string by transliterating to ASCII, converting to lowercase,
-/// removing punctuation, and trimming whitespace.
-/// Takes a string slice to avoid unnecessary memory allocations.
+
 fn normalize_text(text: &str) -> String {
     let unidecoded = deunicode(text);
     let lowercased = unidecoded.to_lowercase();
@@ -88,8 +76,7 @@ fn normalize_text(text: &str) -> String {
     cleaned.trim().to_string()
 }
 
-/// Helper function to process the aggregated data for a single DOI and write it to the CSV.
-/// This contains the logic from the original "Transformation" step.
+
 fn process_and_write_doi_data(
     doi: &str,
     authors: &HashMap<u32, Author>,
@@ -144,7 +131,6 @@ fn process_and_write_doi_data(
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    // --- 1. Argument Parsing and Setup ---
     let start_time = Instant::now();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
@@ -163,12 +149,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     let output_path = cli.output.unwrap();
     info!("Output will be saved to: {}", output_path.display());
 
-    // --- 2. Streaming Aggregation and Writing ---
     info!("Starting streaming aggregation from sorted input file...");
     let file = File::open(&cli.input)?;
     let file_size = file.metadata()?.len();
     
-    // Setup progress bar for reading the input file
     let pb_read = ProgressBar::new(file_size);
     pb_read.set_style(
         ProgressStyle::default_bar()
@@ -180,7 +164,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut rdr = ReaderBuilder::new().from_reader(progress_reader);
     let mut wtr = WriterBuilder::new().from_path(output_path)?;
 
-    // State for the streaming logic
     let mut current_doi: Option<String> = None;
     let mut authors_for_current_doi: HashMap<u32, Author> = HashMap::new();
     let mut total_records_written = 0;
@@ -195,23 +178,17 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         };
         
-        // If current_doi exists and its value is different from the record's DOI,
-        // it means we have finished collecting all data for the previous DOI.
         if current_doi.is_some() && current_doi.as_ref().unwrap() != &record.doi {
-            // The DOI has changed, so we process the data we've collected.
             let doi_to_process = current_doi.clone().unwrap();
             let written_count = process_and_write_doi_data(&doi_to_process, &authors_for_current_doi, &mut wtr)?;
             total_records_written += written_count;
             total_dois_processed += 1;
 
-            // Clear the map to free memory and prepare for the next DOI.
             authors_for_current_doi.clear();
         }
 
-        // --- Update state with the current record's data ---
         current_doi = Some(record.doi.clone());
 
-        // Aggregate data for the current DOI
         let author_index = match AUTHOR_INDEX_RE.captures(&record.subfield_path) {
             Some(caps) => caps.get(1).unwrap().as_str().parse::<u32>()?,
             None => continue,
@@ -241,7 +218,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    // --- Process the very last DOI group after the loop finishes ---
     if let Some(doi) = current_doi {
         if !authors_for_current_doi.is_empty() {
              let written_count = process_and_write_doi_data(&doi, &authors_for_current_doi, &mut wtr)?;
