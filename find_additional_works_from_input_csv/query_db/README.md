@@ -46,7 +46,7 @@ Create a `config.yaml` file to specify your input file format and its processing
 # ----------------------------------------------------
 input_columns:
   doi: "DOI"                        # Column containing DOI identifiers
-  authors: "EMBL author(s) name"    # Column containing author names
+  authors: "Authors"    # Column containing author names
   author_separator: ";"             # Delimiter to use if multiple authors are in one field
 
 # ----------------------------------------------------
@@ -71,9 +71,9 @@ input_name_style: "last f"          # Format in your input CSV
 #    affiliations containing these organization names.
 # ----------------------------------------------------
 organization_names:
-  - "EMBL"
-  - "European Molecular Biology Laboratory"
-  - "EBI"
+  - "Organization Short Name"
+  - "Organization Legal Name"
+  - "Organization Acronym"
   # Add any variations of your organization name
 
 # ----------------------------------------------------
