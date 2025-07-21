@@ -294,6 +294,9 @@ lazy_static! {
         schema.insert("authorships.author.id".to_string(), FieldType::Value);
         schema.insert("authorships.author.display_name".to_string(), FieldType::Value);
         schema.insert("authorships.author.orcid".to_string(), FieldType::Value);
+        schema.insert("authorships.affiliations".to_string(), FieldType::Array);
+        schema.insert("authorships.affiliations.raw_affiliation_string".to_string(), FieldType::Value);
+        schema.insert("authorships.affiliations.institution_ids".to_string(), FieldType::Array);
         schema.insert("authorships.institutions".to_string(), FieldType::Array);
         schema.insert("authorships.institutions.id".to_string(), FieldType::Value);
         schema.insert("authorships.institutions.display_name".to_string(), FieldType::Value);
