@@ -21,7 +21,8 @@ python query_db.py --process-file \
 
 Generates:
 - `results_linkage.csv`: Author-affiliation mappings
-- `results_discovered_works.csv`: Related works by shared affiliations
+- `results_full_discovery_log.csv`: All discovered works with linking details
+- `results_discovered_works.csv`: Deduplicated list of related works
 
 ### Search works by affiliation
 ```bash
@@ -31,6 +32,20 @@ python query_db.py --search-affiliation \
   --db-file publications.duckdb \
   --config config.yaml
 ```
+
+### Discover works via shared affiliations from DOIs
+```bash
+python query_db.py --doi-search \
+  --input-file dois.csv \
+  --output-file results.csv \
+  --db-file publications.duckdb \
+  --config config.yaml
+```
+
+Generates:
+- `results_discovered_works.csv`: New works found via shared affiliations
+- `results_linking_affiliations.csv`: Affiliations used for discovery
+- `results_unmatched_dois.csv`: Input DOIs without matching organization affiliations
 
 
 ## Configuration
@@ -82,6 +97,13 @@ organization_names:
 # ----------------------------------------------------
 affiliation_search_columns:
   affiliation_name: "Institution"   # Column name containing affiliations to search
+
+# ----------------------------------------------------
+# 5. DOI Search Columns (Required for --doi-search mode)
+#    Specifies which column contains DOIs for discovery.
+# ----------------------------------------------------
+doi_search_columns:
+  doi: "DOI"                       # Column name containing DOIs to search
 ```
 
 ### Configuration File Details

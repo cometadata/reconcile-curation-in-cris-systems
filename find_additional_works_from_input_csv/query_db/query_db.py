@@ -1,10 +1,60 @@
 import os
+import re
+import csv
 import sys
 import yaml
 import argparse
+import unicodedata
 import duckdb
-import re
+import jellyfish
 from unidecode import unidecode
+from nameparser import HumanName
+
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(
+        description="""
+        Query the author-affiliation database to find author-affiliation linkages and related works.
+
+        Three modes:
+
+        1. Process work and author file to find linked affiliations:
+           python %(prog)s --process-file --input-file /path/to/input.csv --output-file results.csv --db-file publications.duckdb --config config.yaml
+
+        2. Search for works by affiliation:
+           python %(prog)s --search-affiliation --input-file affiliations.csv --output-file works.csv --db-file publications.duckdb --config config.yaml
+           
+        3. Discover works related to input DOIs via shared affiliations:
+           python %(prog)s --doi-search --input-file dois.csv --output-file results.csv --db-file publications.duckdb --config config.yaml
+        """,
+        formatter_class=argparse.RawTextHelpFormatter
+    )
+    parser.add_argument("-i", "--input-file",
+                        help="Path to the input CSV file.")
+    parser.add_argument("-o", "--output-file",
+                        help="Path to the output CSV file where results will be saved.")
+    parser.add_argument("-d", "--db-file", required=True,
+                        help="Path to the DuckDB database file to use.")
+    parser.add_argument("-m", "--memory-limit", default="8GB",
+                        help="Memory limit for DB processing (e.g., '16GB', '2GB'). Default: 8GB.")
+    parser.add_argument("--config", required=True,
+                        help="Path to the YAML configuration file.")
+
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("-p", "--process-file", action="store_true",
+                      help="Run in file processing mode. Requires --input-file and --output-file.")
+    mode.add_argument("-s", "--search-affiliation", action="store_true",
+                      help="Search for works using a list of affiliations from an input file.")
+    mode.add_argument("-ds", "--doi-search", action="store_true",
+                      help="Run in DOI discovery mode. Finds new works via affiliations from input DOIs.")
+
+    args = parser.parse_args()
+
+    if args.process_file or args.search_affiliation or args.doi_search:
+        if not args.input_file or not args.output_file:
+            parser.error("Both --input-file and --output-file are required.")
+
+    return args
 
 
 def is_latin_char_text(text):
@@ -27,142 +77,159 @@ def normalize_text(text):
     return text
 
 
-def parse_arguments():
-    parser = argparse.ArgumentParser(
-        description="""
-        Query the author-affiliation database to find author-affiliation linkages and related works.
-        
-        Two modes:
-        
-        1. Process work and author file to find linked affiliations:
-           python %(prog)s --process-file --input-file /path/to/input.csv --output-file results.csv --db-file publications.duckdb --config config.yaml
-           
-        2. Search for works by affiliation:
-           python %(prog)s --search-affiliation --input-file affiliations.csv --output-file works.csv --db-file publications.duckdb --config config.yaml
-        """,
-        formatter_class=argparse.RawTextHelpFormatter
-    )
+def parse_name_by_style(name: str, style: str) -> dict:
+    name = name.strip()
 
-    parser.add_argument(
-        "--db-file",
-        required=True,
-        help="Path to the DuckDB database file to use. Default: works.db"
-    )
-    parser.add_argument(
-        "--memory-limit",
-        default="8GB",
-        help="Memory limit for DB processing (e.g., '16GB', '2GB'). Default: 8GB."
-    )
-    parser.add_argument(
-        "--config",
-        required=True,
-        help="Path to the YAML configuration file."
-    )
+    if style == 'last_initial':
+        parts = name.split()
+        if len(parts) >= 2:
+            last_name = ' '.join(parts[:-1])
+            initials = parts[-1]
+            first_initial = initials[0].lower() if initials else ''
 
-    mode = parser.add_mutually_exclusive_group(required=True)
-    mode.add_argument(
-        "--process-file",
-        action="store_true",
-        help="Run in file processing mode. Requires --input-file and --output-file."
-    )
-    mode.add_argument(
-        "--search-affiliation",
-        action="store_true",
-        help="Search for works using a list of affiliations from an input file. Requires --input-file and --output-file."
-    )
+            return {
+                'first': first_initial,
+                'last': last_name.lower(),
+                'middle': '',
+                'normalized': f"{last_name.lower()} {first_initial}",
+                'original': name,
+                'style': style
+            }
+        else:
+            return {
+                'first': '',
+                'last': name.lower(),
+                'middle': '',
+                'normalized': name.lower(),
+                'original': name,
+                'style': style
+            }
 
-    parser.add_argument(
-        "-i", "--input-file",
-        help="Path to the input CSV file."
+    elif style == 'last_comma_first':
+        if ',' in name:
+            parts = name.split(',', 1)
+            last = parts[0].strip()
+            rest = parts[1].strip() if len(parts) > 1 else ''
+
+            rest_parts = rest.split()
+            first = rest_parts[0].lower() if rest_parts else ''
+            middle = ' '.join(rest_parts[1:]).lower() if len(
+                rest_parts) > 1 else ''
+
+            return {
+                'first': first,
+                'last': last.lower(),
+                'middle': middle,
+                'normalized': f"{first} {middle} {last.lower()}".strip(),
+                'original': name,
+                'style': style
+            }
+
+    elif style == 'last_first':
+        parts = name.split()
+        if len(parts) >= 2:
+            last = parts[0]
+            first = parts[1] if len(parts) > 1 else ''
+            middle = ' '.join(parts[2:]) if len(parts) > 2 else ''
+
+            return {
+                'first': first.lower(),
+                'last': last.lower(),
+                'middle': middle.lower(),
+                'normalized': f"{first.lower()} {middle.lower()} {last.lower()}".strip(),
+                'original': name,
+                'style': style
+            }
+
+    elif style == 'first_initial_last':
+        parts = name.split()
+        initials = []
+        last_idx = -1
+
+        for i, part in enumerate(parts):
+            if len(part) <= 2 and (part.endswith('.') or len(part) == 1):
+                initials.append(part.replace('.', '').lower())
+            else:
+                last_idx = i
+                break
+
+        if last_idx >= 0:
+            last = ' '.join(parts[last_idx:])
+            first = initials[0] if initials else ''
+            middle = ' '.join(initials[1:]) if len(initials) > 1 else ''
+
+            return {
+                'first': first,
+                'last': last.lower(),
+                'middle': middle,
+                'normalized': f"{first} {middle} {last.lower()}".strip(),
+                'original': name,
+                'style': style
+            }
+
+    parsed = HumanName(name)
+    first = (parsed.first or '').strip()
+    last = (parsed.last or '').strip()
+    middle = (parsed.middle or '').strip()
+
+    clean = f"{first} {middle} {last}".strip()
+    clean = unicodedata.normalize('NFKD', clean).encode(
+        'ascii', 'ignore').decode()
+    normalized = re.sub(r'[-.,]', ' ', clean.lower()).strip()
+
+    return {
+        'first': first.lower(),
+        'last': last.lower(),
+        'middle': middle.lower(),
+        'normalized': normalized,
+        'original': name,
+        'style': 'first_last'
+    }
+
+
+def are_names_similar(name1_str, name2_str, name1_style='auto', name2_style='auto', threshold=0.85):
+    name1 = parse_name_by_style(name1_str, name1_style)
+    name2 = parse_name_by_style(name2_str, name2_style)
+
+    if not name1['last'] or not name2['last']:
+        return name1['normalized'] == name2['normalized']
+
+    last_similarity = jellyfish.jaro_winkler_similarity(
+        name1['last'],
+        name2['last']
     )
-    parser.add_argument(
-        "-o", "--output-file",
-        help="Path to the output CSV file where results will be saved."
-    )
+    if last_similarity < threshold:
+        return False
 
-    args = parser.parse_args()
+    if name1['first'] and name2['first']:
+        if len(name1['first']) == 1 or len(name2['first']) == 1:
+            if name1['first'][0] == name2['first'][0]:
+                return True
+        else:
+            first_similarity = jellyfish.jaro_winkler_similarity(
+                name1['first'],
+                name2['first']
+            )
+            if first_similarity >= threshold:
+                return True
 
-    if args.process_file:
-        if not args.input_file or not args.output_file:
-            parser.error(
-                "--process-file mode requires --input-file and --output-file.")
-    elif args.search_affiliation:
-        if not args.input_file or not args.output_file:
-            parser.error(
-                "--search-affiliation mode requires --input-file and --output-file.")
+    if last_similarity >= 0.95:
+        return True
 
-    return args
+    return False
 
 
 def load_config(config_path):
     try:
         with open(config_path, 'r') as f:
             config = yaml.safe_load(f)
-
-        required_keys = ['input_columns',
-                         'reference_name_style', 'input_name_style']
-        for key in required_keys:
-            if key not in config:
-                raise ValueError(f"Missing required configuration key: {key}")
-
-        input_cols_required = ['doi', 'authors', 'author_separator']
-        for key in input_cols_required:
-            if key not in config['input_columns']:
-                raise ValueError(f"Missing required input_columns key: {key}")
-
         return config
     except Exception as e:
         print(f"Error loading configuration file: {e}")
         sys.exit(1)
 
 
-def generate_name_normalization_sql(name_style, column_name, is_for_matching=False):
-    if name_style == 'first last':
-        # 'John Doe' -> 'doe j'
-        return f"""
-            lower(
-                list_extract(string_split({column_name}, ' '), -1) || ' ' || 
-                substr(list_extract(string_split({column_name}, ' '), 1), 1, 1)
-            )
-        """
-    elif name_style == 'last first':
-        # 'Doe John' -> 'doe j'
-        return f"""
-            lower(
-                list_extract(string_split({column_name}, ' '), 1) || ' ' || 
-                substr(list_extract(string_split({column_name}, ' '), 2), 1, 1)
-            )
-        """
-    elif name_style == 'last, first':
-        # 'Doe, John' -> 'doe j'
-        return f"""
-            lower(
-                list_extract(string_split({column_name}, ', '), 1) || ' ' || 
-                substr(list_extract(string_split({column_name}, ', '), 2), 1, 1)
-            )
-        """
-    elif name_style == 'last, f':
-        # 'Doe, J' -> 'doe j'
-        return f"""
-            lower(
-                list_extract(string_split({column_name}, ', '), 1) || ' ' || 
-                lower(list_extract(string_split({column_name}, ', '), 2))
-            )
-        """
-    elif name_style == 'last f':
-        # 'Doe J' -> 'doe j'
-        return f"lower(trim({column_name}))"
-    elif name_style == 'last':
-        # 'Doe' -> 'doe'
-        if is_for_matching:
-            return f"lower(trim(list_extract(string_split({column_name}, ' '), 1)))"
-        else:
-            return f"lower(trim({column_name}))"
-    else:
-        raise ValueError(f"Unsupported name style: {name_style}")
-
-
-def process_publications(db_file, input_file, output_file, memory_limit, config):
+def process_publications_enhanced(db_file, input_file, output_file, memory_limit, config):
     print("--- Running in Processing Mode ---")
     if not os.path.exists(db_file):
         print(f"Error: Database file not found. Run build_db.py first.")
@@ -171,8 +238,17 @@ def process_publications(db_file, input_file, output_file, memory_limit, config)
         print(f"Error: Input file not found at '{input_file}'")
         sys.exit(1)
 
+    try:
+        input_doi_col = config['input_columns']['doi']
+        authors_col = config['input_columns']['authors']
+        author_sep = config['input_columns']['author_separator']
+    except KeyError as e:
+        print(f"Error: Config file missing required key in 'input_columns': {e}")
+        sys.exit(1)
+
     base_path, _ = os.path.splitext(output_file)
     linkage_output_file = f"{base_path}_linkage.csv"
+    full_log_output_file = f"{base_path}_full_discovery_log.csv"
     discovery_output_file = f"{base_path}_discovered_works.csv"
 
     con = duckdb.connect(database=db_file, read_only=True)
@@ -180,156 +256,184 @@ def process_publications(db_file, input_file, output_file, memory_limit, config)
     print(f"Setting memory limit to {memory_limit}.")
     con.execute(f"SET memory_limit='{memory_limit}';")
 
-    print(f"Processing publications from '{input_file}'...")
-
     try:
-        input_doi_col = config['input_columns']['doi']
-        authors_col = config['input_columns']['authors']
-        author_sep = config['input_columns']['author_separator']
-        input_name_style = config.get('input_name_style', 'last f')
-        input_norm_sql = generate_name_normalization_sql(
-            input_name_style, 'input_author_raw')
-        
-        ref_norm_sql = generate_name_normalization_sql('first last', 'ref.full_name')
-
-        org_names = config.get('organization_names', [])
-        if org_names:
-            org_conditions = [f"lower(ref.normalized_affiliation) ILIKE '%{name.lower()}%'" for name in org_names]
-            org_filter_sql = " OR ".join(org_conditions)
-            ranking_sql = f"""
-                ROW_NUMBER() OVER(
-                    PARTITION BY inp.input_doi, inp.input_author_raw 
-                    ORDER BY
-                        CASE 
-                            WHEN {org_filter_sql} THEN 1
-                            ELSE 2
-                        END
-                ) as affiliation_rank
-            """
-            match_priority_sql = f"""
-                CASE 
-                    WHEN {org_filter_sql} THEN 'organization_name_match'
-                    ELSE 'first_available'
-                END
-            """
-        else:
-            ranking_sql = """
-                ROW_NUMBER() OVER(
-                    PARTITION BY inp.input_doi, inp.input_author_raw 
-                    ORDER BY ref.normalized_affiliation
-                ) as affiliation_rank
-            """
-            match_priority_sql = "'first_available'"
-
-        sql_query_linkage = f"""
-        COPY (
-            WITH
-            -- Read input and split author field
-            input_authors AS (
-                SELECT
-                    "{input_doi_col}" AS input_doi,
-                    UNNEST(string_split(trim("{authors_col}"), $${author_sep}$$)) AS input_author_raw
-                FROM read_csv_auto('{input_file}', HEADER=TRUE, DELIM=',', QUOTE='"')
-            ),
-            
-            -- Normalize input authors
-            normalized_input AS (
-                SELECT
-                    input_doi,
-                    input_author_raw,
-                    {input_norm_sql} AS normalized_input_author
-                FROM input_authors
-            ),
-
-            -- Find and rank affiliations
-            found_affiliations_ranked AS (
-                SELECT
-                    inp.input_doi,
-                    inp.input_author_raw,
-                    ref.full_name AS found_full_name,
-                    ref.normalized_affiliation AS found_affiliation,
-                    ref.normalized_affiliation_key,
-                    {ranking_sql},
-                    {match_priority_sql} AS match_priority
-                FROM normalized_input AS inp
-                JOIN author_references AS ref
-                    ON inp.input_doi = ref.doi
-                    AND (
-                        -- Exact match using on-the-fly normalization
-                        inp.normalized_input_author = ({ref_norm_sql})
-                        OR
-                        -- Last name only match: check against the on-the-fly normalized name
-                        (
-                            NOT CONTAINS(inp.input_author_raw, ' ') 
-                            AND inp.normalized_input_author = list_extract(string_split(({ref_norm_sql}), ' '), 1)
-                        )
-                    )
-            ),
-
-            -- Filter for only the top-ranked affiliation
-            best_affiliation AS (
-                SELECT * FROM found_affiliations_ranked WHERE affiliation_rank = 1
-            )
-            
-            -- Select and rename columns for the linkage file
-            SELECT 
-                input_doi,
-                input_author_raw AS input_author_name,
-                found_full_name AS ref_author_name,
-                found_affiliation AS ref_affiliation,
-                match_priority
-            FROM best_affiliation
-            ORDER BY input_doi, input_author_name
-
-        ) TO '{linkage_output_file}' (HEADER, DELIMITER ',');
+        print("Registering all input DOIs for exclusion...")
+        all_input_dois_query = f"""
+            CREATE OR REPLACE TEMP VIEW all_input_dois AS
+            SELECT DISTINCT "{input_doi_col}" AS doi
+            FROM read_csv_auto('{input_file}', HEADER=TRUE);
         """
+        con.execute(all_input_dois_query)
 
-        print(f"Running linkage analysis... saving to '{linkage_output_file}'")
-        con.execute(sql_query_linkage)
+        print(f"Processing publications from '{input_file}'...")
 
-        sql_query_discovery = f"""
+        input_name_style = config.get('input_name_style', 'auto')
+        reference_name_style = config.get('reference_name_style', 'first_last')
+        matching_threshold = config.get('name_matching_threshold', 0.85)
+
+        organization_names = config.get('organization_names', [])
+        normalized_org_names = [normalize_text(
+            name) for name in organization_names] if organization_names else []
+
+        print(f"Using input name style: {input_name_style}")
+        print(f"Using reference name style: {reference_name_style}")
+        print(f"Using matching threshold: {matching_threshold}")
+        if normalized_org_names:
+            print(f"Prioritizing {len(normalized_org_names)} organization names.")
+
+        print("Loading input authors...")
+        input_authors_query = f"""
+            SELECT DISTINCT
+                "{input_doi_col}" AS input_doi,
+                UNNEST(string_split(trim("{authors_col}"), $${author_sep}$$)) AS input_author_raw
+            FROM read_csv_auto('{input_file}', HEADER=TRUE, DELIM=',', QUOTE='"')
+            WHERE "{authors_col}" IS NOT NULL
+        """
+        input_authors = con.execute(input_authors_query).fetchall()
+        print(f"Found {len(input_authors)} author entries to process")
+
+        print("Finding matches using enhanced name and affiliation validation...")
+        matches = []
+        processed_dois = set()
+
+        for doi, author_name in input_authors:
+            if doi in processed_dois:
+                continue
+
+            db_authors_query = f"""
+                SELECT DISTINCT author_name, normalized_affiliation_name
+                FROM author_references WHERE doi = '{doi}'
+            """
+            db_authors = con.execute(db_authors_query).fetchall()
+            processed_dois.add(doi)
+
+            doi_input_authors = [(d, a) for d, a in input_authors if d == doi]
+
+            for _, input_author in doi_input_authors:
+                potential_matches = []
+                for db_author, affiliation in db_authors:
+                    if are_names_similar(
+                        input_author.strip(), db_author,
+                        name1_style=input_name_style, name2_style=reference_name_style,
+                        threshold=matching_threshold
+                    ):
+                        potential_matches.append(
+                            {'db_author': db_author, 'affiliation': affiliation})
+
+                if not potential_matches:
+                    continue
+
+                org_matching_affiliations = []
+                if normalized_org_names:
+                    for match in potential_matches:
+                        affil = match.get('affiliation')
+                        if affil:
+                            normalized_affil = normalize_text(affil)
+                            if any(org_name in normalized_affil for org_name in normalized_org_names):
+                                org_matching_affiliations.append(match)
+
+                final_match_author = None
+                final_affiliation = None
+                linkage_status = None
+
+                if org_matching_affiliations:
+                    linkage_status = 'org_match_found'
+                    first_match = org_matching_affiliations[0]
+                    final_match_author = first_match['db_author']
+                    final_affiliation = first_match['affiliation']
+                else:
+                    first_potential = potential_matches[0]
+                    final_match_author = first_potential['db_author']
+                    final_affiliation = first_potential['affiliation']
+
+                    if not organization_names:
+                        linkage_status = 'first_available'
+                    else:
+                        linkage_status = 'name_match_no_org_affiliation'
+
+                if final_match_author:
+                    matches.append({
+                        'input_doi': doi,
+                        'input_author_name': input_author.strip(),
+                        'ref_author_name': final_match_author,
+                        'ref_affiliation': final_affiliation,
+                        'linkage_status': linkage_status
+                    })
+
+        print(f"Found {len(matches)} author-affiliation linkages")
+
+        print(f"Writing linkage results to '{linkage_output_file}'...")
+        with open(linkage_output_file, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=['input_doi', 'input_author_name',
+                                                   'ref_author_name', 'ref_affiliation',
+                                                   'linkage_status'])
+            writer.writeheader()
+            writer.writerows(matches)
+
+        sql_query_full_log = f"""
         COPY (
             WITH linkage_data AS (
-                SELECT
-                    input_doi,
-                    input_author_name,
-                    ref_affiliation,
-                    -- We need the normalized key for an efficient join
-                    lower(trim(ref_affiliation)) as normalized_affiliation_key
-                FROM read_csv_auto('{linkage_output_file}', HEADER=TRUE)
-                WHERE ref_affiliation IS NOT NULL  -- Filter out NULL affiliations
+                SELECT * FROM read_csv_auto('{linkage_output_file}', HEADER=TRUE)
             )
             SELECT
-                ld.input_doi AS query_doi,
-                ld.input_author_name AS query_author_name,
+                ld.input_doi,
+                ld.input_author_name,
                 ld.ref_affiliation AS linking_affiliation,
-                collab.doi AS discovered_work_doi,
-                collab.full_name AS discovered_work_author,
-                collab.normalized_affiliation AS discovered_work_author_affiliation
+                collab.doi AS discovered_doi,
+                collab.author_name AS discovered_author,
+                collab.affiliation_name AS discovered_author_affiliation,
+                collab.affiliation_ror AS discovered_ror_id
             FROM linkage_data AS ld
-            JOIN author_references AS collab 
-                ON ld.normalized_affiliation_key = collab.normalized_affiliation_key
-                AND ld.normalized_affiliation_key IS NOT NULL
-                AND collab.normalized_affiliation_key IS NOT NULL
-                AND ld.input_doi != collab.doi
-            ORDER BY query_doi, query_author_name, discovered_work_doi
+            JOIN author_references AS collab
+                ON lower(trim(ld.ref_affiliation)) = collab.normalized_affiliation_key
+            LEFT JOIN all_input_dois AS exclude_dois ON collab.doi = exclude_dois.doi
+            WHERE (ld.linkage_status = 'org_match_found' OR ld.linkage_status = 'first_available')
+            AND exclude_dois.doi IS NULL
+            ORDER BY ld.input_doi, ld.input_author_name, discovered_doi
+        ) TO '{full_log_output_file}' (HEADER, DELIMITER ',');
+        """
 
+        sql_query_deduplicated_works = f"""
+        COPY (
+            WITH distinct_linking_affiliations AS (
+                SELECT DISTINCT
+                    lower(trim(ref_affiliation)) AS normalized_affiliation_key
+                FROM read_csv_auto('{linkage_output_file}', HEADER=TRUE)
+                WHERE ref_affiliation IS NOT NULL
+                AND (linkage_status = 'org_match_found' OR linkage_status = 'first_available')
+            )
+            SELECT DISTINCT
+                collab.doi AS doi,
+                collab.author_name AS author,
+                collab.affiliation_name AS author_affiliation,
+                collab.affiliation_ror AS ror_id
+            FROM distinct_linking_affiliations AS dla
+            JOIN author_references AS collab
+                ON dla.normalized_affiliation_key = collab.normalized_affiliation_key
+            LEFT JOIN all_input_dois AS exclude_dois ON collab.doi = exclude_dois.doi
+            WHERE exclude_dois.doi IS NULL
+            ORDER BY doi, author
         ) TO '{discovery_output_file}' (HEADER, DELIMITER ',');
         """
-        
-        print(f"Discovering related works... saving to '{discovery_output_file}'")
-        con.execute(sql_query_discovery)
+
+        print(f"Generating full discovery log... saving to '{full_log_output_file}'")
+        con.execute(sql_query_full_log)
+
+        print(f"Generating deduplicated works list... saving to '{discovery_output_file}'")
+        con.execute(sql_query_deduplicated_works)
 
     except Exception as e:
         print(f"An unexpected error occurred during processing: {e}")
-        print(f"\nDebug - Generated SQL:\n{sql_query_linkage[:500]}...")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
     finally:
         con.close()
 
     print(f"\nProcessing complete.")
     print(f"-> Linkage results saved to '{linkage_output_file}'")
-    print(f"-> Discovered works saved to '{discovery_output_file}'")
+    print(f"-> Full discovery log saved to '{full_log_output_file}'")
+    print(f"-> Deduplicated discovered works saved to '{discovery_output_file}'")
 
 
 def search_by_affiliation(db_file, input_file, output_file, memory_limit, config):
@@ -352,28 +456,27 @@ def search_by_affiliation(db_file, input_file, output_file, memory_limit, config
     con.execute(f"SET memory_limit='{memory_limit}';")
 
     try:
-        con.create_function('normalize_affiliation_udf', normalize_text, [str], str)
+        con.create_function('normalize_affiliation_udf',
+                            normalize_text, [str], str)
 
         sql_query = f"""
         COPY (
             WITH input_data AS (
-                -- Read the input file and apply the normalization UDF
                 SELECT
                     *,
                     normalize_affiliation_udf("{search_col}") AS normalized_search_key
                 FROM read_csv_auto('{input_file}', HEADER=TRUE, ALL_VARCHAR=TRUE)
             )
-            -- Join with the main reference table on the normalized keys
             SELECT
                 inp."{search_col}" AS input_search_term,
                 ref.doi AS ref_doi,
-                ref.full_name AS ref_author_name,
-                ref.normalized_affiliation AS ref_affiliation,
+                ref.author_name AS ref_author_name,
+                ref.normalized_affiliation_name AS ref_affiliation,
                 ref.normalized_affiliation_key AS ref_affiliation_normalized_key
             FROM author_references AS ref
             JOIN input_data AS inp
-              ON ref.normalized_affiliation_key = inp.normalized_search_key
-            ORDER BY input_search_term, ref.doi, ref.full_name
+                ON ref.normalized_affiliation_key = inp.normalized_search_key
+            ORDER BY input_search_term, ref.doi, ref.author_name
         ) TO '{output_file}' (HEADER, DELIMITER ',');
         """
 
@@ -388,13 +491,132 @@ def search_by_affiliation(db_file, input_file, output_file, memory_limit, config
         con.close()
 
 
+def search_by_doi_and_org(db_file, input_file, output_file, memory_limit, config):
+    print("--- Running in DOI Discovery Mode ---")
+    if not os.path.exists(db_file):
+        print("Error: Database file not found. Run build_db.py first.")
+        sys.exit(1)
+    if not os.path.exists(input_file):
+        print(f"Error: Input file not found at '{input_file}'")
+        sys.exit(1)
+
+    try:
+        doi_col = config['doi_search_columns']['doi']
+        organization_names = config.get('organization_names', [])
+        if not organization_names:
+            print(
+                "Error: 'organization_names' list in config must not be empty for this mode.")
+            sys.exit(1)
+    except KeyError:
+        print("Error: Config file must contain 'doi_search_columns.doi'.")
+        sys.exit(1)
+
+    base_path, _ = os.path.splitext(output_file)
+    discovered_works_file = f"{base_path}_discovered_works.csv"
+    linking_affiliations_file = f"{base_path}_linking_affiliations.csv"
+    unmatched_dois_file = f"{base_path}_unmatched_dois.csv"
+
+    normalized_org_names = [normalize_text(
+        name) for name in organization_names]
+
+    con = duckdb.connect(database=db_file, read_only=True)
+    con.execute(f"SET memory_limit='{memory_limit}';")
+
+    try:
+        print(f"Loading DOIs from '{input_file}'...")
+        con.execute(f"""
+            CREATE OR REPLACE TEMP VIEW input_dois AS
+            SELECT DISTINCT "{doi_col}" AS doi
+            FROM read_csv_auto('{input_file}', HEADER=TRUE);
+        """)
+
+        con.execute("CREATE OR REPLACE TEMP TABLE org_names (name TEXT)")
+        for name in normalized_org_names:
+            con.execute("INSERT INTO org_names VALUES (?)", (name,))
+
+        print("Phase 1: Identifying linking affiliations from input DOIs...")
+        find_linking_affiliations_query = f"""
+        CREATE OR REPLACE TEMP VIEW linking_affiliations AS
+        SELECT DISTINCT
+            ar.normalized_affiliation_key
+        FROM author_references AS ar
+        INNER JOIN input_dois AS id ON ar.doi = id.doi
+        WHERE EXISTS (
+            SELECT 1
+            FROM org_names AS onames
+            WHERE CONTAINS(ar.normalized_affiliation_key, onames.name)
+        );
+        
+        COPY (SELECT * FROM linking_affiliations) TO '{linking_affiliations_file}' (HEADER, DELIMITER ',');
+        """
+        con.execute(find_linking_affiliations_query)
+        print(f"-> Found linking affiliations. Log saved to '{linking_affiliations_file}'.")
+
+        print("Phase 2: Discovering new works from linking affiliations...")
+        discover_works_query = f"""
+        COPY (
+            SELECT
+                ar.doi,
+                ar.author_name,
+                ar.affiliation_name,
+                ar.affiliation_ror
+            FROM author_references AS ar
+            INNER JOIN linking_affiliations AS la ON ar.normalized_affiliation_key = la.normalized_affiliation_key
+            LEFT JOIN input_dois AS id ON ar.doi = id.doi
+            WHERE id.doi IS NULL
+            ORDER BY ar.doi, ar.author_name
+        ) TO '{discovered_works_file}' (HEADER, DELIMITER ',');
+        """
+        con.execute(discover_works_query)
+        print(f"-> Found new works. Results saved to '{discovered_works_file}'.")
+
+        # Phase 3: Identify input DOIs that did not contribute to the linking affiliations list
+        print("Phase 3: Identifying unmatched input DOIs...")
+        find_unmatched_dois_query = f"""
+        COPY (
+            SELECT
+                id.doi
+            FROM input_dois AS id
+            LEFT JOIN (
+                SELECT DISTINCT doi
+                FROM author_references ar
+                WHERE EXISTS (
+                    SELECT 1
+                    FROM org_names AS onames
+                    WHERE CONTAINS(ar.normalized_affiliation_key, onames.name)
+                )
+            ) AS matched_from_input ON id.doi = matched_from_input.doi
+            WHERE matched_from_input.doi IS NULL
+            ORDER BY id.doi
+        ) TO '{unmatched_dois_file}' (HEADER, DELIMITER ',');
+        """
+        con.execute(find_unmatched_dois_query)
+        print(f"-> Found unmatched DOIs. List saved to '{unmatched_dois_file}'.")
+
+    except Exception as e:
+        print(f"An error occurred during DOI discovery: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+    finally:
+        con.close()
+
+    print("\nDOI discovery complete.")
+    print(f"-> Discovered works saved to '{discovered_works_file}'")
+    print(f"-> Linking affiliations log saved to '{linking_affiliations_file}'")
+    print(f"-> Unmatched input DOIs saved to '{unmatched_dois_file}'")
+
+
 if __name__ == '__main__':
     args = parse_arguments()
     config = load_config(args.config)
 
     if args.process_file:
-        process_publications(args.db_file, args.input_file,
-                             args.output_file, args.memory_limit, config)
+        process_publications_enhanced(args.db_file, args.input_file,
+                                      args.output_file, args.memory_limit, config)
     elif args.search_affiliation:
         search_by_affiliation(
+            args.db_file, args.input_file, args.output_file, args.memory_limit, config)
+    elif args.doi_search:
+        search_by_doi_and_org(
             args.db_file, args.input_file, args.output_file, args.memory_limit, config)
