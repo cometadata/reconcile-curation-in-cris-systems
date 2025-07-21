@@ -1,6 +1,6 @@
 ### Reconcile Curation in CRIS Systems Pipeline
 
-The pipeline begins by processing a Crossref public data file snapshot using the [crossref-fast-field-parse utility](https://github.com/cometadata/reconcile-curation-in-cris-systems/tree/main/parsing-utils/crossref-fast-field-parse). Here, we extract the metadata fields necessary for analysis and reconciliation (e.g. `author.family`, `author.given`, `author.affiliation.name`, and `DOI`) from the gzipped JSONL files and output in CSV format.
+The pipeline begins by processing an OpenAlex works data snapshot using the [openalex-fast-field-parse utility](https://github.com/cometadata/reconcile-curation-in-cris-systems/tree/main/parsing-utils/openalex-fast-field-parse). Here, we extract the metadata fields necessary for analysis and reconciliation (e.g. `authorships.author.display_name`, `authorships.institutions.display_name`, and `doi`) from the gzipped JSONL files and output in CSV format.
 
 This raw, field-level CSV is then fed into the [parse_join_normalize_author_affiliation_metadata utility](https://github.com/cometadata/reconcile-curation-in-cris-systems/tree/main/parsing-utils/parse_join_normalize_author_affiliation_metadata). This processes the input, aggregating and normalizing the various fields into coherent entries where authors and affiliations are linked, outputting the results as a new CSV file.
 
