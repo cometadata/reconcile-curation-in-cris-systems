@@ -75,7 +75,7 @@ def setup_database(db_file, reference_file, memory_limit):
             CREATE OR REPLACE TABLE author_references AS
             SELECT
                 *,
-                lower(trim(normalized_affiliation)) as normalized_affiliation_key
+                lower(trim(normalized_affiliation_name)) as normalized_affiliation_key
             FROM read_csv_auto(
                 '{reference_file}',
                 HEADER=TRUE,
@@ -83,7 +83,7 @@ def setup_database(db_file, reference_file, memory_limit):
                 ALL_VARCHAR=TRUE,
                 SAMPLE_SIZE=-1
             )
-            WHERE full_name IS NOT NULL AND normalized_affiliation IS NOT NULL;
+            WHERE author_name IS NOT NULL AND normalized_affiliation_name IS NOT NULL;
         """
 
         con.execute(create_table_sql)
@@ -92,9 +92,11 @@ def setup_database(db_file, reference_file, memory_limit):
         print("Creating indexes for fast lookups...")
         con.execute("CREATE INDEX idx_doi ON author_references (doi);")
         con.execute(
-            "CREATE INDEX idx_norm_name ON author_references (normalized_full_name);")
+            "CREATE INDEX idx_norm_name ON author_references (normalized_author_name);")
         con.execute(
             "CREATE INDEX idx_norm_affil ON author_references (normalized_affiliation_key);")
+        con.execute(
+            "CREATE INDEX idx_ror ON author_references (affiliation_ror);")
         print("Indexes created successfully.")
 
         print("Database build is complete!")
