@@ -39,12 +39,13 @@ openalex-fast-field-parse -i /data/openalex -f "doi,publication_year,cited_by_co
 ## Output Format
 
 CSV with columns:
-- `doi` - Document DOI
+- `work_id` - OpenAlex work ID (primary identifier)
+- `doi` - Document DOI (if available)
 - `field_name` - Requested field name
 - `subfield_path` - Full path including array indices
 - `value` - Extracted value
-- `source_id` - OpenAlex source ID
-- `doi_prefix` - DOI prefix
+- `source_id` - OpenAlex source ID (from primary_location.source)
+- `doi_prefix` - DOI prefix (extracted from DOI)
 - `source_file_path` - Source file path
 
 ## Available Fields
