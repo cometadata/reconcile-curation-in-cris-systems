@@ -24,8 +24,8 @@ def parse_arguments():
         2. Search for works by affiliation:
            python %(prog)s --search-affiliation --input-file affiliations.csv --output-file works.csv --db-file publications.duckdb --config config.yaml
            
-        3. Discover works related to input DOIs via shared affiliations:
-           python %(prog)s --doi-search --input-file dois.csv --output-file results.csv --db-file publications.duckdb --config config.yaml
+        3. Discover works related to input IDs (DOIs/Work IDs) via shared affiliations:
+           python %(prog)s --id-search --input-file ids.csv --output-file results.csv --db-file publications.duckdb --config config.yaml
         """,
         formatter_class=argparse.RawTextHelpFormatter
     )
@@ -45,14 +45,20 @@ def parse_arguments():
                       help="Run in file processing mode. Requires --input-file and --output-file.")
     mode.add_argument("-s", "--search-affiliation", action="store_true",
                       help="Search for works using a list of affiliations from an input file.")
+    mode.add_argument("-ids", "--id-search", action="store_true",
+                      help="Run in ID discovery mode. Finds new works via affiliations from input DOIs or Work IDs.")
     mode.add_argument("-ds", "--doi-search", action="store_true",
-                      help="Run in DOI discovery mode. Finds new works via affiliations from input DOIs.")
+                      help="(Legacy) Same as --id-search. Kept for backward compatibility.")
 
     args = parser.parse_args()
 
-    if args.process_file or args.search_affiliation or args.doi_search:
+    if args.process_file or args.search_affiliation or args.doi_search or args.id_search:
         if not args.input_file or not args.output_file:
             parser.error("Both --input-file and --output-file are required.")
+    
+    # Map legacy doi-search to id-search
+    if args.doi_search:
+        args.id_search = True
 
     return args
 
@@ -239,7 +245,14 @@ def process_publications_enhanced(db_file, input_file, output_file, memory_limit
         sys.exit(1)
 
     try:
-        input_doi_col = config['input_columns']['doi']
+        # Get ID columns - at least one should be present
+        input_doi_col = config['input_columns'].get('doi')
+        input_work_id_col = config['input_columns'].get('work_id')
+        
+        if not input_doi_col and not input_work_id_col:
+            print("Error: Config must specify at least one of 'doi' or 'work_id' in input_columns")
+            sys.exit(1)
+            
         authors_col = config['input_columns']['authors']
         author_sep = config['input_columns']['author_separator']
     except KeyError as e:
@@ -257,13 +270,26 @@ def process_publications_enhanced(db_file, input_file, output_file, memory_limit
     con.execute(f"SET memory_limit='{memory_limit}';")
 
     try:
-        print("Registering all input DOIs for exclusion...")
-        all_input_dois_query = f"""
-            CREATE OR REPLACE TEMP VIEW all_input_dois AS
-            SELECT DISTINCT "{input_doi_col}" AS doi
+        print("Registering all input IDs for exclusion...")
+        
+        # Build query based on available columns
+        id_columns = []
+        if input_doi_col:
+            id_columns.append(f'"{input_doi_col}" AS doi')
+        else:
+            id_columns.append('NULL AS doi')
+            
+        if input_work_id_col:
+            id_columns.append(f'"{input_work_id_col}" AS work_id')
+        else:
+            id_columns.append('NULL AS work_id')
+            
+        all_input_ids_query = f"""
+            CREATE OR REPLACE TEMP VIEW all_input_ids AS
+            SELECT DISTINCT {', '.join(id_columns)}
             FROM read_csv_auto('{input_file}', HEADER=TRUE);
         """
-        con.execute(all_input_dois_query)
+        con.execute(all_input_ids_query)
 
         print(f"Processing publications from '{input_file}'...")
 
@@ -282,9 +308,22 @@ def process_publications_enhanced(db_file, input_file, output_file, memory_limit
             print(f"Prioritizing {len(normalized_org_names)} organization names.")
 
         print("Loading input authors...")
+        
+        # Build ID selection based on available columns
+        id_selection = []
+        if input_doi_col:
+            id_selection.append(f'"{input_doi_col}" AS input_doi')
+        else:
+            id_selection.append('NULL AS input_doi')
+            
+        if input_work_id_col:
+            id_selection.append(f'"{input_work_id_col}" AS input_work_id')
+        else:
+            id_selection.append('NULL AS input_work_id')
+            
         input_authors_query = f"""
             SELECT DISTINCT
-                "{input_doi_col}" AS input_doi,
+                {', '.join(id_selection)},
                 UNNEST(string_split(trim("{authors_col}"), $${author_sep}$$)) AS input_author_raw
             FROM read_csv_auto('{input_file}', HEADER=TRUE, DELIM=',', QUOTE='"')
             WHERE "{authors_col}" IS NOT NULL
@@ -294,22 +333,66 @@ def process_publications_enhanced(db_file, input_file, output_file, memory_limit
 
         print("Finding matches using enhanced name and affiliation validation...")
         matches = []
-        processed_dois = set()
+        processed_ids = set()
 
-        for doi, author_name in input_authors:
-            if doi in processed_dois:
+        for row in input_authors:
+            # Row always has 3 columns due to our query structure
+            # (input_doi or NULL, input_work_id or NULL, author_name)
+            doi, work_id, author_name = row
+            
+            # Convert database NULLs to Python None
+            if doi is None or doi == 'NULL':
+                doi = None
+            if work_id is None or work_id == 'NULL':
+                work_id = None
+            
+            # Create unique ID for tracking
+            id_key = (doi, work_id)
+            if id_key in processed_ids:
                 continue
 
+            # Build query to match on either doi or work_id
+            where_conditions = []
+            if doi:
+                # Escape single quotes in DOI for SQL
+                escaped_doi = doi.replace("'", "''")
+                where_conditions.append(f"doi = '{escaped_doi}'")
+            if work_id:
+                # Escape single quotes in work_id for SQL
+                escaped_work_id = work_id.replace("'", "''")
+                where_conditions.append(f"work_id = '{escaped_work_id}'")
+            
+            if not where_conditions:
+                continue
+                
             db_authors_query = f"""
                 SELECT DISTINCT author_name, normalized_affiliation_name
-                FROM author_references WHERE doi = '{doi}'
+                FROM author_references 
+                WHERE {' OR '.join(where_conditions)}
             """
             db_authors = con.execute(db_authors_query).fetchall()
-            processed_dois.add(doi)
+            processed_ids.add(id_key)
 
-            doi_input_authors = [(d, a) for d, a in input_authors if d == doi]
+            # Get all input authors for this work
+            work_input_authors = []
+            for r in input_authors:
+                # All rows have 3 columns
+                r_doi, r_work_id, r_author = r
+                
+                # Convert database NULLs to Python None for comparison
+                if r_doi is None or r_doi == 'NULL':
+                    r_doi = None
+                if r_work_id is None or r_work_id == 'NULL':
+                    r_work_id = None
+                
+                # Check if this row belongs to the same work
+                same_doi = (r_doi == doi) if (r_doi is not None or doi is not None) else True
+                same_work_id = (r_work_id == work_id) if (r_work_id is not None or work_id is not None) else True
+                
+                if same_doi and same_work_id:
+                    work_input_authors.append((r_doi, r_work_id, r_author))
 
-            for _, input_author in doi_input_authors:
+            for _, _, input_author in work_input_authors:
                 potential_matches = []
                 for db_author, affiliation in db_authors:
                     if are_names_similar(
@@ -353,7 +436,8 @@ def process_publications_enhanced(db_file, input_file, output_file, memory_limit
 
                 if final_match_author:
                     matches.append({
-                        'input_doi': doi,
+                        'input_doi': doi if doi else '',
+                        'input_work_id': work_id if work_id else '',
                         'input_author_name': input_author.strip(),
                         'ref_author_name': final_match_author,
                         'ref_affiliation': final_affiliation,
@@ -364,7 +448,7 @@ def process_publications_enhanced(db_file, input_file, output_file, memory_limit
 
         print(f"Writing linkage results to '{linkage_output_file}'...")
         with open(linkage_output_file, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.DictWriter(f, fieldnames=['input_doi', 'input_author_name',
+            writer = csv.DictWriter(f, fieldnames=['input_doi', 'input_work_id', 'input_author_name',
                                                    'ref_author_name', 'ref_affiliation',
                                                    'linkage_status'])
             writer.writeheader()
@@ -377,8 +461,10 @@ def process_publications_enhanced(db_file, input_file, output_file, memory_limit
             )
             SELECT
                 ld.input_doi,
+                ld.input_work_id,
                 ld.input_author_name,
                 ld.ref_affiliation AS linking_affiliation,
+                collab.work_id AS discovered_work_id,
                 collab.doi AS discovered_doi,
                 collab.author_name AS discovered_author,
                 collab.affiliation_name AS discovered_author_affiliation,
@@ -386,9 +472,11 @@ def process_publications_enhanced(db_file, input_file, output_file, memory_limit
             FROM linkage_data AS ld
             JOIN author_references AS collab
                 ON lower(trim(ld.ref_affiliation)) = collab.normalized_affiliation_key
-            LEFT JOIN all_input_dois AS exclude_dois ON collab.doi = exclude_dois.doi
+            LEFT JOIN all_input_ids AS exclude_ids 
+                ON (collab.doi = exclude_ids.doi AND collab.doi IS NOT NULL AND exclude_ids.doi IS NOT NULL) 
+                OR (collab.work_id = exclude_ids.work_id AND collab.work_id IS NOT NULL AND exclude_ids.work_id IS NOT NULL)
             WHERE (ld.linkage_status = 'org_match_found' OR ld.linkage_status = 'first_available')
-            AND exclude_dois.doi IS NULL
+            AND COALESCE(exclude_ids.doi, exclude_ids.work_id) IS NULL
             ORDER BY ld.input_doi, ld.input_author_name, discovered_doi
         ) TO '{full_log_output_file}' (HEADER, DELIMITER ',');
         """
@@ -403,6 +491,7 @@ def process_publications_enhanced(db_file, input_file, output_file, memory_limit
                 AND (linkage_status = 'org_match_found' OR linkage_status = 'first_available')
             )
             SELECT DISTINCT
+                collab.work_id AS work_id,
                 collab.doi AS doi,
                 collab.author_name AS author,
                 collab.affiliation_name AS author_affiliation,
@@ -410,8 +499,10 @@ def process_publications_enhanced(db_file, input_file, output_file, memory_limit
             FROM distinct_linking_affiliations AS dla
             JOIN author_references AS collab
                 ON dla.normalized_affiliation_key = collab.normalized_affiliation_key
-            LEFT JOIN all_input_dois AS exclude_dois ON collab.doi = exclude_dois.doi
-            WHERE exclude_dois.doi IS NULL
+            LEFT JOIN all_input_ids AS exclude_ids 
+                ON (collab.doi = exclude_ids.doi AND collab.doi IS NOT NULL AND exclude_ids.doi IS NOT NULL) 
+                OR (collab.work_id = exclude_ids.work_id AND collab.work_id IS NOT NULL AND exclude_ids.work_id IS NOT NULL)
+            WHERE COALESCE(exclude_ids.doi, exclude_ids.work_id) IS NULL
             ORDER BY doi, author
         ) TO '{discovery_output_file}' (HEADER, DELIMITER ',');
         """
@@ -469,6 +560,7 @@ def search_by_affiliation(db_file, input_file, output_file, memory_limit, config
             )
             SELECT
                 inp."{search_col}" AS input_search_term,
+                ref.work_id AS ref_work_id,
                 ref.doi AS ref_doi,
                 ref.author_name AS ref_author_name,
                 ref.normalized_affiliation_name AS ref_affiliation,
@@ -491,8 +583,8 @@ def search_by_affiliation(db_file, input_file, output_file, memory_limit, config
         con.close()
 
 
-def search_by_doi_and_org(db_file, input_file, output_file, memory_limit, config):
-    print("--- Running in DOI Discovery Mode ---")
+def search_by_id_and_org(db_file, input_file, output_file, memory_limit, config):
+    print("--- Running in ID Discovery Mode ---")
     if not os.path.exists(db_file):
         print("Error: Database file not found. Run build_db.py first.")
         sys.exit(1)
@@ -501,20 +593,32 @@ def search_by_doi_and_org(db_file, input_file, output_file, memory_limit, config
         sys.exit(1)
 
     try:
-        doi_col = config['doi_search_columns']['doi']
+        # Try new id_search_columns first, fall back to doi_search_columns for compatibility
+        if 'id_search_columns' in config:
+            doi_col = config['id_search_columns'].get('doi')
+            work_id_col = config['id_search_columns'].get('work_id')
+        else:
+            # Legacy support
+            doi_col = config.get('doi_search_columns', {}).get('doi')
+            work_id_col = None
+            
+        if not doi_col and not work_id_col:
+            print("Error: Config must specify at least one of 'doi' or 'work_id' in id_search_columns.")
+            sys.exit(1)
+            
         organization_names = config.get('organization_names', [])
         if not organization_names:
             print(
                 "Error: 'organization_names' list in config must not be empty for this mode.")
             sys.exit(1)
-    except KeyError:
-        print("Error: Config file must contain 'doi_search_columns.doi'.")
+    except KeyError as e:
+        print(f"Error: Config file missing required key: {e}")
         sys.exit(1)
 
     base_path, _ = os.path.splitext(output_file)
     discovered_works_file = f"{base_path}_discovered_works.csv"
     linking_affiliations_file = f"{base_path}_linking_affiliations.csv"
-    unmatched_dois_file = f"{base_path}_unmatched_dois.csv"
+    unmatched_ids_file = f"{base_path}_unmatched_ids.csv"
 
     normalized_org_names = [normalize_text(
         name) for name in organization_names]
@@ -523,10 +627,23 @@ def search_by_doi_and_org(db_file, input_file, output_file, memory_limit, config
     con.execute(f"SET memory_limit='{memory_limit}';")
 
     try:
-        print(f"Loading DOIs from '{input_file}'...")
+        print(f"Loading IDs from '{input_file}'...")
+        
+        # Build query based on available columns
+        id_columns = []
+        if doi_col:
+            id_columns.append(f'"{doi_col}" AS doi')
+        else:
+            id_columns.append('NULL AS doi')
+            
+        if work_id_col:
+            id_columns.append(f'"{work_id_col}" AS work_id')
+        else:
+            id_columns.append('NULL AS work_id')
+            
         con.execute(f"""
-            CREATE OR REPLACE TEMP VIEW input_dois AS
-            SELECT DISTINCT "{doi_col}" AS doi
+            CREATE OR REPLACE TEMP VIEW input_ids AS
+            SELECT DISTINCT {', '.join(id_columns)}
             FROM read_csv_auto('{input_file}', HEADER=TRUE);
         """)
 
@@ -534,13 +651,15 @@ def search_by_doi_and_org(db_file, input_file, output_file, memory_limit, config
         for name in normalized_org_names:
             con.execute("INSERT INTO org_names VALUES (?)", (name,))
 
-        print("Phase 1: Identifying linking affiliations from input DOIs...")
+        print("Phase 1: Identifying linking affiliations from input IDs...")
         find_linking_affiliations_query = f"""
         CREATE OR REPLACE TEMP VIEW linking_affiliations AS
         SELECT DISTINCT
             ar.normalized_affiliation_key
         FROM author_references AS ar
-        INNER JOIN input_dois AS id ON ar.doi = id.doi
+        INNER JOIN input_ids AS id 
+            ON (ar.doi = id.doi AND id.doi IS NOT NULL) 
+            OR (ar.work_id = id.work_id AND id.work_id IS NOT NULL)
         WHERE EXISTS (
             SELECT 1
             FROM org_names AS onames
@@ -556,55 +675,61 @@ def search_by_doi_and_org(db_file, input_file, output_file, memory_limit, config
         discover_works_query = f"""
         COPY (
             SELECT
+                ar.work_id,
                 ar.doi,
                 ar.author_name,
                 ar.affiliation_name,
                 ar.affiliation_ror
             FROM author_references AS ar
             INNER JOIN linking_affiliations AS la ON ar.normalized_affiliation_key = la.normalized_affiliation_key
-            LEFT JOIN input_dois AS id ON ar.doi = id.doi
-            WHERE id.doi IS NULL
-            ORDER BY ar.doi, ar.author_name
+            LEFT JOIN input_ids AS id 
+                ON (ar.doi = id.doi AND id.doi IS NOT NULL) 
+                OR (ar.work_id = id.work_id AND id.work_id IS NOT NULL)
+            WHERE id.doi IS NULL AND id.work_id IS NULL
+            ORDER BY ar.work_id, ar.doi, ar.author_name
         ) TO '{discovered_works_file}' (HEADER, DELIMITER ',');
         """
         con.execute(discover_works_query)
         print(f"-> Found new works. Results saved to '{discovered_works_file}'.")
 
-        # Phase 3: Identify input DOIs that did not contribute to the linking affiliations list
-        print("Phase 3: Identifying unmatched input DOIs...")
-        find_unmatched_dois_query = f"""
+        # Phase 3: Identify input IDs that did not contribute to the linking affiliations list
+        print("Phase 3: Identifying unmatched input IDs...")
+        find_unmatched_ids_query = f"""
         COPY (
             SELECT
+                id.work_id,
                 id.doi
-            FROM input_dois AS id
+            FROM input_ids AS id
             LEFT JOIN (
-                SELECT DISTINCT doi
+                SELECT DISTINCT work_id, doi
                 FROM author_references ar
                 WHERE EXISTS (
                     SELECT 1
                     FROM org_names AS onames
                     WHERE CONTAINS(ar.normalized_affiliation_key, onames.name)
                 )
-            ) AS matched_from_input ON id.doi = matched_from_input.doi
-            WHERE matched_from_input.doi IS NULL
-            ORDER BY id.doi
-        ) TO '{unmatched_dois_file}' (HEADER, DELIMITER ',');
+            ) AS matched_from_input 
+                ON (id.doi = matched_from_input.doi AND id.doi IS NOT NULL) 
+                OR (id.work_id = matched_from_input.work_id AND id.work_id IS NOT NULL)
+            WHERE matched_from_input.doi IS NULL AND matched_from_input.work_id IS NULL
+            ORDER BY id.work_id, id.doi
+        ) TO '{unmatched_ids_file}' (HEADER, DELIMITER ',');
         """
-        con.execute(find_unmatched_dois_query)
-        print(f"-> Found unmatched DOIs. List saved to '{unmatched_dois_file}'.")
+        con.execute(find_unmatched_ids_query)
+        print(f"-> Found unmatched IDs. List saved to '{unmatched_ids_file}'.")
 
     except Exception as e:
-        print(f"An error occurred during DOI discovery: {e}")
+        print(f"An error occurred during ID discovery: {e}")
         import traceback
         traceback.print_exc()
         sys.exit(1)
     finally:
         con.close()
 
-    print("\nDOI discovery complete.")
+    print("\nID discovery complete.")
     print(f"-> Discovered works saved to '{discovered_works_file}'")
     print(f"-> Linking affiliations log saved to '{linking_affiliations_file}'")
-    print(f"-> Unmatched input DOIs saved to '{unmatched_dois_file}'")
+    print(f"-> Unmatched input IDs saved to '{unmatched_ids_file}'")
 
 
 if __name__ == '__main__':
@@ -617,6 +742,6 @@ if __name__ == '__main__':
     elif args.search_affiliation:
         search_by_affiliation(
             args.db_file, args.input_file, args.output_file, args.memory_limit, config)
-    elif args.doi_search:
-        search_by_doi_and_org(
+    elif args.id_search:
+        search_by_id_and_org(
             args.db_file, args.input_file, args.output_file, args.memory_limit, config)
