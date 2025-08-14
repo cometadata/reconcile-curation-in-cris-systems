@@ -63,6 +63,9 @@ struct Cli {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct WorkId(String);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct Doi(String);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -73,11 +76,12 @@ struct DoiPrefix(String);
 
 #[derive(Debug, Clone)]
 struct FieldData {
-    doi: Doi,
+    work_id: WorkId,
+    doi: Option<Doi>,
     field_name: String,
     subfield_path: String,
     value: String,
-    source_id: SourceId,
+    source_id: Option<SourceId>,
     doi_prefix: DoiPrefix,
     source_file_path: PathBuf,
 }
@@ -85,11 +89,12 @@ struct FieldData {
 impl Default for FieldData {
     fn default() -> Self {
         Self {
-            doi: Doi(String::new()),
+            work_id: WorkId(String::new()),
+            doi: None,
             field_name: String::new(),
             subfield_path: String::new(),
             value: String::new(),
-            source_id: SourceId(String::new()),
+            source_id: None,
             doi_prefix: DoiPrefix(String::new()),
             source_file_path: PathBuf::new(),
         }
@@ -98,6 +103,7 @@ impl Default for FieldData {
 
 #[derive(Debug, Default)]
 struct FileStats {
+    unique_work_ids: HashSet<WorkId>,
     unique_dois: HashSet<Doi>,
     field_counts: HashMap<String, usize>,
     source_counts: HashMap<SourceId, usize>,
@@ -139,8 +145,8 @@ impl IncrementalStats {
         self.processed_files_ok.fetch_add(1, Ordering::Relaxed);
         self.total_field_records.fetch_add(file_stats.total_fields_extracted, Ordering::Relaxed);
 
-        for doi in file_stats.unique_dois {
-            self.unique_records.insert(doi.0);
+        for work_id in file_stats.unique_work_ids {
+            self.unique_records.insert(work_id.0);
         }
 
         for (field_name, count) in file_stats.field_counts {
@@ -188,7 +194,7 @@ impl IncrementalStats {
             total_field_records: self.total_field_records.load(Ordering::Relaxed),
             processed_files_ok: self.processed_files_ok.load(Ordering::Relaxed),
             processed_files_error: self.processed_files_error.load(Ordering::Relaxed),
-            unique_dois: self.unique_records.len(),
+            unique_work_ids: self.unique_records.len(),
             unique_sources: final_sources,
             unique_prefixes: final_prefixes,
             unique_fields: final_fields,
@@ -200,7 +206,7 @@ struct FinalStats {
     total_field_records: usize,
     processed_files_ok: usize,
     processed_files_error: usize,
-    unique_dois: usize,
+    unique_work_ids: usize,
     unique_sources: HashMap<SourceId, usize>,
     unique_prefixes: HashMap<DoiPrefix, usize>,
     unique_fields: HashMap<String, usize>,
@@ -560,7 +566,7 @@ impl FileProcessor for JsonlProcessor {
 
         let mut lines_processed = 0;
         let mut records_processed = 0;
-        let mut records_missing_doi = 0;
+        let mut records_missing_work_id = 0;
         let mut records_missing_source = 0;
         let mut records_filtered_out = 0;
         let mut json_parsing_errors = 0;
@@ -583,6 +589,7 @@ impl FileProcessor for JsonlProcessor {
                 Ok(record) => {
                     records_processed += 1;
 
+                    let work_id_opt = extract_work_id(&record);
                     let source_id_opt = extract_source_id(&record);
                     let doi_opt = extract_doi(&record);
                     let doi_prefix_opt = extract_doi_prefix(doi_opt.as_ref());
@@ -600,27 +607,28 @@ impl FileProcessor for JsonlProcessor {
                          }
                      }
 
-                     let source_id = match source_id_opt {
+                     let work_id = match work_id_opt {
                          Some(id) => id,
                          None => {
-                             records_missing_source += 1;
+                             records_missing_work_id += 1;
                              continue;
                          }
                      };
-                     let doi = match doi_opt {
-                          Some(id) => id,
-                          None => {
-                              records_missing_doi += 1;
-                              continue;
-                          }
-                     };
+                     if source_id_opt.is_none() {
+                         records_missing_source += 1;
+                     }
                      let doi_prefix = doi_prefix_opt.unwrap_or_else(|| DoiPrefix("".to_string()));
 
                     let extracted_fields = self.extractor.extract(&record);
 
                     if !extracted_fields.is_empty() {
-                        file_stats.unique_dois.insert(doi.clone());
-                        *file_stats.source_counts.entry(source_id.clone()).or_insert(0) += extracted_fields.len();
+                        file_stats.unique_work_ids.insert(work_id.clone());
+                        if let Some(ref doi) = doi_opt {
+                            file_stats.unique_dois.insert(doi.clone());
+                        }
+                        if let Some(ref source_id) = source_id_opt {
+                            *file_stats.source_counts.entry(source_id.clone()).or_insert(0) += extracted_fields.len();
+                        }
                         *file_stats.prefix_counts.entry(doi_prefix.clone()).or_insert(0) += extracted_fields.len();
 
                         for (field_name, subfield_path, value) in extracted_fields {
@@ -628,11 +636,12 @@ impl FileProcessor for JsonlProcessor {
                             file_stats.total_fields_extracted += 1;
 
                             batch_buffer.push(FieldData {
-                                doi: doi.clone(),
+                                work_id: work_id.clone(),
+                                doi: doi_opt.clone(),
                                 field_name,
                                 subfield_path,
                                 value,
-                                source_id: source_id.clone(),
+                                source_id: source_id_opt.clone(),
                                 doi_prefix: doi_prefix.clone(),
                                 source_file_path: filepath.to_path_buf(),
                             });
@@ -660,13 +669,13 @@ impl FileProcessor for JsonlProcessor {
         }
 
         debug!(
-            "Finished processing {}: {} lines read, {} records parsed ({} JSON errors), {} fields extracted. Skipped: {} missing DOI, {} missing Source, {} filtered out.",
+            "Finished processing {}: {} lines read, {} records parsed ({} JSON errors), {} fields extracted. Skipped: {} missing work ID, {} missing Source, {} filtered out.",
             filepath.display(),
             lines_processed,
             records_processed,
             json_parsing_errors,
             file_stats.total_fields_extracted,
-            records_missing_doi,
+            records_missing_work_id,
             records_missing_source,
             records_filtered_out
         );
@@ -675,6 +684,12 @@ impl FileProcessor for JsonlProcessor {
     }
 }
 
+
+fn extract_work_id(record: &Value) -> Option<WorkId> {
+    record.get("id")
+        .and_then(Value::as_str)
+        .map(|s| WorkId(s.to_string()))
+}
 
 fn extract_doi(record: &Value) -> Option<Doi> {
     record.get("doi")
@@ -893,6 +908,7 @@ impl SingleFileOutput {
         }
 
         let headers = vec![
+            "work_id".to_string(),
             "doi".to_string(),
             "field_name".to_string(),
             "subfield_path".to_string(),
@@ -926,12 +942,15 @@ impl OutputStrategy for SingleFileOutput {
         }
 
         for field_data in batch {
+            let doi_str = field_data.doi.as_ref().map(|d| d.0.as_str()).unwrap_or("");
+            let source_id_str = field_data.source_id.as_ref().map(|s| s.0.as_str()).unwrap_or("");
             self.writer.write_record(&[
-                &field_data.doi.0,
+                &field_data.work_id.0,
+                doi_str,
                 &field_data.field_name,
                 &field_data.subfield_path,
                 &field_data.value,
-                &field_data.source_id.0,
+                source_id_str,
                 &field_data.doi_prefix.0,
                 &field_data.source_file_path.display().to_string(),
             ])?;
@@ -972,6 +991,7 @@ impl OrganizedOutput {
         info!("Using a maximum of {} open files at once", max_open_files);
 
         let headers = vec![
+            "work_id".to_string(),
             "doi".to_string(),
             "field_name".to_string(),
             "subfield_path".to_string(),
@@ -1055,7 +1075,7 @@ impl OutputStrategy for OrganizedOutput {
             return Ok(());
         }
 
-        let mut grouped_records: HashMap<SourceId, Vec<&FieldData>> = HashMap::new();
+        let mut grouped_records: HashMap<Option<SourceId>, Vec<&FieldData>> = HashMap::new();
         for field_data in batch {
              grouped_records
                 .entry(field_data.source_id.clone())
@@ -1063,17 +1083,21 @@ impl OutputStrategy for OrganizedOutput {
                 .push(field_data);
         }
 
-        for (source_id, records) in grouped_records {
+        for (source_id_opt, records) in grouped_records {
+            let source_id = source_id_opt.unwrap_or_else(|| SourceId("unknown".to_string()));
             let writer = self.get_writer(&source_id)
                 .with_context(|| format!("Failed to get writer for source {}", source_id.0))?;
 
             for field_data in records {
+                 let doi_str = field_data.doi.as_ref().map(|d| d.0.as_str()).unwrap_or("");
+                 let source_id_str = field_data.source_id.as_ref().map(|s| s.0.as_str()).unwrap_or("");
                  writer.write_record(&[
-                     &field_data.doi.0,
+                     &field_data.work_id.0,
+                     doi_str,
                      &field_data.field_name,
                      &field_data.subfield_path,
                      &field_data.value,
-                     &field_data.source_id.0,
+                     source_id_str,
                      &field_data.doi_prefix.0,
                      &field_data.source_file_path.display().to_string(),
                  ])?;
@@ -1393,7 +1417,7 @@ fn print_final_summary(
         }
     }
     info!("Total field records extracted: {}", final_stats.total_field_records);
-    info!("Unique DOIs encountered: {}", final_stats.unique_dois);
+    info!("Unique work IDs encountered: {}", final_stats.unique_work_ids);
     info!("Unique Sources encountered: {}", final_stats.unique_sources.len());
     info!("Unique DOI Prefixes encountered: {}", final_stats.unique_prefixes.len());
 
