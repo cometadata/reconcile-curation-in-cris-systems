@@ -25,16 +25,22 @@ python build_db.py --reference-file /path/to/data.csv --db-file publications.duc
 - `--skip-indexes`: Skip index creation during build
 
 ### Input CSV Schema
-Required columns:
-- `work_id`: OpenAlex work identifier
+Required columns (from parse_join_normalize_author_affiliation_metadata):
+- `work_id`: OpenAlex work identifier (required)
 - `doi`: Digital Object Identifier (optional)
-- `author_sequence`: Author position in work
-- `author_name`: Author full name
-- `normalized_author_name`: Normalized author name
-- `affiliation_sequence`: Affiliation position
-- `affiliation_name`: Institution name
-- `normalized_affiliation_name`: Normalized institution name
-- `affiliation_ror`: ROR identifier for institution
+- `field_name`: Field name from OpenAlex data (required) - must include:
+  - `authorships.author.display_name`
+  - `authorships.affiliations.raw_affiliation_string` 
+  - `authorships.affiliations.institution_ids`
+  - `authorships.institutions.id`
+  - `authorships.institutions.ror`
+- `subfield_path`: Path to subfield with array indices (required) - e.g., `authorships[0].affiliations[0]`
+- `value`: The actual value of the field (required)
+- `source_id`: Source identifier (optional)
+- `doi_prefix`: DOI prefix (optional)
+- `source_file_path`: Path to source file (optional)
+
+Note: The input CSV should be the output from the `parse_join_normalize_author_affiliation_metadata` utility, which processes OpenAlex data and extracts these specific author/affiliation fields in a flattened format.
 
 ### Output Database
 Creates table `author_references` with:
