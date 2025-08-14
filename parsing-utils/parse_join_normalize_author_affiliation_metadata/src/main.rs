@@ -15,15 +15,20 @@ use std::time::Instant;
 
 mod external_sort {
     use super::{Cli, InputRecord};
+    use crossbeam_channel::bounded;
     use csv::{ReaderBuilder, WriterBuilder};
     use indicatif::{ProgressBar, ProgressStyle};
     use log::{error, info};
+    use rayon::prelude::*;
     use std::cmp::Ordering;
     use std::collections::BinaryHeap;
     use std::error::Error;
     use std::fs::{self, File};
-    use std::io::Write;
+    use std::io::{BufReader, Read, Write};
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::Arc;
+    use std::thread;
 
     const MERGE_WIDTH: usize = 100;
 
@@ -35,7 +40,7 @@ mod external_sort {
 
     impl Ord for HeapEntry {
         fn cmp(&self, other: &Self) -> Ordering {
-            other.record.doi.cmp(&self.record.doi)
+            other.record.work_id.cmp(&self.record.work_id)
         }
     }
 
@@ -49,47 +54,145 @@ mod external_sort {
         input_path: &Path,
         chunks_dir: &Path,
         chunk_size: usize,
-    ) -> Result<Vec<PathBuf>, Box<dyn Error>> {
-        info!("Phase 1: Creating sorted chunks...");
-        let rdr = ReaderBuilder::new().from_path(input_path)?;
-        let mut chunk = Vec::with_capacity(chunk_size);
-        let mut chunk_files = Vec::new();
-        let mut chunk_index = 0;
-
-        let pb = ProgressBar::new(fs::metadata(input_path)?.len());
+    ) -> Result<Vec<PathBuf>, Box<dyn Error + Send + Sync>> {
+        info!("Phase 1: Creating sorted chunks in parallel...");
+        
+        const BLOCK_SIZE: usize = 256 * 1024 * 1024; // 256MB blocks
+        let num_workers = num_cpus::get();
+        info!("Using {} worker threads for parallel chunk creation", num_workers);
+        
+        let (tx, rx) = bounded::<(Vec<u8>, bool)>(num_workers * 2);
+        let chunk_index = Arc::new(AtomicUsize::new(0));
+        let chunks_dir = chunks_dir.to_path_buf();
+        
+        // Producer thread - reads blocks from the input file
+        let input_path_clone = input_path.to_path_buf();
+        let file_size = fs::metadata(input_path)?.len();
+        
+        let pb = ProgressBar::new(file_size);
         pb.set_style(ProgressStyle::default_bar()
             .template("{spinner:.green} Sorting Chunks [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")?
             .progress_chars("#>-"));
-
-        let mut reader_wrapper = pb.wrap_read(rdr.into_inner());
-        let mut rdr = ReaderBuilder::new().from_reader(&mut reader_wrapper);
-
-        for result in rdr.deserialize::<InputRecord>() {
-            chunk.push(result?);
-            if chunk.len() >= chunk_size {
-                chunk.sort_by(|a, b| a.doi.cmp(&b.doi));
-                let temp_path = chunks_dir.join(format!("chunk_{}.csv.zst", chunk_index));
-                write_chunk(&chunk, &temp_path)?;
-                chunk_files.push(temp_path);
-                chunk.clear();
-                chunk_index += 1;
+        
+        let pb_clone = pb.clone();
+        let producer_handle = thread::spawn(move || -> Result<(), Box<dyn Error + Send + Sync>> {
+            let file = File::open(&input_path_clone)?;
+            let mut reader = BufReader::with_capacity(BLOCK_SIZE, file);
+            let mut buffer = Vec::with_capacity(BLOCK_SIZE);
+            let mut leftover = Vec::new();
+            let mut is_first_block = true;
+            
+            loop {
+                buffer.clear();
+                buffer.extend_from_slice(&leftover);
+                leftover.clear();
+                
+                let bytes_read = reader.by_ref().take((BLOCK_SIZE - buffer.len()) as u64).read_to_end(&mut buffer)?;
+                pb_clone.inc(bytes_read as u64);
+                
+                if buffer.is_empty() {
+                    break;
+                }
+                
+                if bytes_read > 0 {
+                    if let Some(last_newline_pos) = buffer.iter().rposition(|&b| b == b'\n') {
+                        leftover.extend_from_slice(&buffer[last_newline_pos + 1..]);
+                        buffer.truncate(last_newline_pos + 1);
+                    }
+                }
+                
+                if !buffer.is_empty() {
+                    if tx.send((buffer.clone(), is_first_block)).is_err() {
+                        break;
+                    }
+                    is_first_block = false;
+                }
+                
+                if bytes_read == 0 && leftover.is_empty() {
+                    break;
+                }
             }
-        }
-
-        if !chunk.is_empty() {
-            chunk.sort_by(|a, b| a.doi.cmp(&b.doi));
-            let temp_path = chunks_dir.join(format!("chunk_{}.csv.zst", chunk_index));
-            write_chunk(&chunk, &temp_path)?;
-            chunk_files.push(temp_path);
-        }
-
+            
+            if !leftover.is_empty() {
+                let _ = tx.send((leftover, is_first_block));
+            }
+            
+            Ok(())
+        });
+        
+        let chunk_files: Vec<PathBuf> = rx.into_iter()
+            .par_bridge()
+            .map(|(byte_chunk, has_header)| -> Result<Vec<PathBuf>, Box<dyn Error + Send + Sync>> {
+                let mut chunk_files = Vec::new();
+                let mut rdr = ReaderBuilder::new()
+                    .has_headers(has_header)
+                    .flexible(true)
+                    .from_reader(byte_chunk.as_slice());
+                let mut records = Vec::with_capacity(chunk_size);
+                
+                for result in rdr.deserialize::<InputRecord>() {
+                    let record = match result {
+                        Ok(rec) => rec,
+                        Err(e) => {
+                            error!("Error deserializing a row during chunking: {}. Skipping.", e);
+                            continue; // Go to the next iteration
+                        }
+                    };
+                    records.push(record);
+                    
+                    if records.len() >= chunk_size {
+                        records.sort_by(|a, b| a.work_id.cmp(&b.work_id));
+                        let idx = chunk_index.fetch_add(1, AtomicOrdering::SeqCst);
+                        let temp_path = chunks_dir.join(format!("chunk_{}.csv.zst", idx));
+                        write_chunk(&records, &temp_path)?;
+                        chunk_files.push(temp_path);
+                        records.clear();
+                    }
+                }
+                
+                if !records.is_empty() {
+                    records.sort_by(|a, b| a.work_id.cmp(&b.work_id));
+                    let idx = chunk_index.fetch_add(1, AtomicOrdering::SeqCst);
+                    let temp_path = chunks_dir.join(format!("chunk_{}.csv.zst", idx));
+                    write_chunk(&records, &temp_path)?;
+                    chunk_files.push(temp_path);
+                }
+                
+                Ok(chunk_files)
+            })
+            .try_fold(Vec::new, |mut acc, result| -> Result<Vec<Vec<PathBuf>>, Box<dyn Error + Send + Sync>> {
+                acc.push(result?);
+                Ok(acc)
+            })
+            .try_reduce(Vec::new, |mut a, b| {
+                a.extend(b);
+                Ok(a)
+            })?
+            .into_iter()
+            .flatten()
+            .collect();
+        
+        producer_handle.join()
+            .map_err(|e| -> Box<dyn Error + Send + Sync> {
+                Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!("Producer thread panicked: {:?}", e)))
+            })??;
         pb.finish_with_message("Chunking complete.");
-        Ok(chunk_files)
+        
+        let mut sorted_chunk_files = chunk_files;
+        sorted_chunk_files.sort_by_key(|path| {
+            path.file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.strip_prefix("chunk_"))
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(0)
+        });
+        
+        Ok(sorted_chunk_files)
     }
 
-    fn write_chunk(chunk: &[InputRecord], path: &Path) -> Result<(), Box<dyn Error>> {
+    fn write_chunk(chunk: &[InputRecord], path: &Path) -> Result<(), Box<dyn Error + Send + Sync>> {
         let file = File::create(path)?;
-        let encoder = zstd::Encoder::new(file, 10)?.auto_finish();
+        let encoder = zstd::Encoder::new(file, 3)?.auto_finish();
         let mut wtr = WriterBuilder::new().from_writer(encoder);
         for record in chunk {
             wtr.serialize(record)?;
@@ -101,7 +204,7 @@ mod external_sort {
     fn merge_chunks(
         chunk_files: &[PathBuf],
         output_path: &Path,
-    ) -> Result<(), Box<dyn Error>> {
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
         info!("Phase 2: Merging {} chunks...", chunk_files.len());
         let mut readers: Vec<_> = chunk_files
             .iter()
@@ -110,12 +213,12 @@ mod external_sort {
                 let decoder = zstd::Decoder::new(file)?;
                 Ok(ReaderBuilder::new().from_reader(decoder))
             })
-            .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+            .collect::<Result<Vec<_>, Box<dyn Error + Send + Sync>>>()?;
 
         let output_file = File::create(output_path)?;
         let writer: Box<dyn Write> = if output_path.extension().and_then(|s| s.to_str()) == Some("zst") {
             info!("-> Writing compressed intermediate file: {}", output_path.display());
-            Box::new(zstd::Encoder::new(output_file, 10)?.auto_finish())
+            Box::new(zstd::Encoder::new(output_file, 3)?.auto_finish())
         } else {
             info!("-> Writing final uncompressed file: {}", output_path.display());
             Box::new(output_file)
@@ -150,7 +253,7 @@ mod external_sort {
         Ok(())
     }
     
-    pub fn sort_csv(cli: &Cli, output_path: &Path, chunks_dir: &Path) -> Result<(), Box<dyn Error>> {
+    pub fn sort_csv(cli: &Cli, output_path: &Path, chunks_dir: &Path) -> Result<(), Box<dyn Error + Send + Sync>> {
         let mut current_pass_dir = chunks_dir.join("pass_0");
         fs::create_dir_all(&current_pass_dir)?;
         let mut chunk_files = create_sorted_chunks(&cli.input, &current_pass_dir, cli.chunk_size)?;
@@ -159,7 +262,7 @@ mod external_sort {
         while chunk_files.len() > MERGE_WIDTH {
             pass_num += 1;
             info!(
-                "Starting merge pass {}: merging {} chunks in groups of {}",
+                "Starting parallel merge pass {}: merging {} chunks in groups of {}",
                 pass_num,
                 chunk_files.len(),
                 MERGE_WIDTH
@@ -167,16 +270,24 @@ mod external_sort {
 
             let next_pass_dir = chunks_dir.join(format!("pass_{}", pass_num));
             fs::create_dir_all(&next_pass_dir)?;
-            let mut next_level_chunks = Vec::new();
-
-            for (i, group) in chunk_files.chunks(MERGE_WIDTH).enumerate() {
-                let intermediate_output_path =
-                    next_pass_dir.join(format!("intermediate_chunk_{}.csv.zst", i));
-                
-                merge_chunks(group, &intermediate_output_path)?;
-                next_level_chunks.push(intermediate_output_path);
-
-                for chunk_to_delete in group {
+            
+            let merge_results: Vec<(PathBuf, Vec<PathBuf>)> = chunk_files
+                .chunks(MERGE_WIDTH)
+                .collect::<Vec<_>>()
+                .into_par_iter()
+                .enumerate()
+                .map(|(i, group)| -> Result<(PathBuf, Vec<PathBuf>), Box<dyn Error + Send + Sync>> {
+                    let intermediate_output_path =
+                        next_pass_dir.join(format!("intermediate_chunk_{}.csv.zst", i));
+                    
+                    merge_chunks(group, &intermediate_output_path)?;
+                    
+                    Ok((intermediate_output_path, group.to_vec()))
+                })
+                .collect::<Result<Vec<_>, Box<dyn Error + Send + Sync>>>()?;
+            
+            for (_, group_to_delete) in &merge_results {
+                for chunk_to_delete in group_to_delete {
                     if let Err(e) = fs::remove_file(chunk_to_delete) {
                         error!("Failed to delete intermediate chunk {}: {}", chunk_to_delete.display(), e);
                     }
@@ -188,7 +299,7 @@ mod external_sort {
                 error!("Could not remove pass directory {}: {}", current_pass_dir.display(), e);
             }
 
-            chunk_files = next_level_chunks;
+            chunk_files = merge_results.into_iter().map(|(path, _)| path).collect();
             current_pass_dir = next_pass_dir;
         }
 
@@ -212,7 +323,7 @@ lazy_static! {
 }
 
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = "A memory-efficient Rust script that first sorts a large CSV by 'doi' and then processes it.")]
+#[command(author, version, about, long_about = "A memory-efficient Rust script that first sorts a large CSV by 'work_id' and then processes it.")]
 struct Cli {
     #[arg(short = 'i', long)]
     input: PathBuf,
@@ -229,14 +340,18 @@ struct Cli {
 
 #[derive(Debug, Deserialize, Serialize, Clone, Eq, PartialEq)]
 struct InputRecord {
-    doi: String,
+    work_id: String,
+    doi: Option<String>,
     field_name: String,
     subfield_path: String,
     value: String,
     #[allow(dead_code)]
-    source_id: String,
+    #[serde(rename = "source_id")] // This line fixes the error
+    source: Option<String>,
     #[allow(dead_code)]
-    doi_prefix: String,
+    doi_prefix: Option<String>,
+    #[allow(dead_code)]
+    source_file_path: Option<String>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -247,7 +362,8 @@ struct Author {
 
 #[derive(Debug, Serialize)]
 struct OutputRecord {
-    doi: String,
+    work_id: String,
+    doi: Option<String>,
     author_sequence: u32,
     author_name: String,
     normalized_author_name: String,
@@ -278,11 +394,12 @@ struct TempInstitution {
 }
 
 
-fn process_doi_group(
-    doi: &str,
+fn process_work_group(
+    work_id: &str,
+    doi: &Option<String>,
     records: &[InputRecord],
     wtr: &mut csv::Writer<File>,
-) -> Result<usize, Box<dyn Error>> {
+) -> Result<usize, Box<dyn Error + Send + Sync>> {
     let mut records_written = 0;
 
     let mut authors: HashMap<u32, Author> = HashMap::new();
@@ -369,7 +486,8 @@ fn process_doi_group(
 
         if author_affiliations.is_empty() {
             let record = OutputRecord {
-                doi: doi.to_string(),
+                work_id: work_id.to_string(),
+                doi: doi.clone(),
                 author_sequence: author.sequence,
                 author_name: author_name.to_string(),
                 normalized_author_name,
@@ -394,7 +512,8 @@ fn process_doi_group(
                 }
 
                 let record = OutputRecord {
-                    doi: doi.to_string(),
+                    work_id: work_id.to_string(),
+                    doi: doi.clone(),
                     author_sequence: author.sequence,
                     author_name: author_name.to_string(),
                     normalized_author_name: normalized_author_name.clone(),
@@ -411,7 +530,7 @@ fn process_doi_group(
     Ok(records_written)
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
+fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let overall_start_time = Instant::now();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
@@ -456,13 +575,17 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
 
     let progress_reader = pb_read.wrap_read(file);
-    let mut rdr = ReaderBuilder::new().from_reader(progress_reader);
-    let mut wtr = WriterBuilder::new().from_path(output_path)?;
+    let mut rdr = ReaderBuilder::new()
+        .flexible(true)
+        .from_reader(progress_reader);
+    let mut wtr = WriterBuilder::new()
+        .from_path(output_path)?;
 
+    let mut current_work_id: Option<String> = None;
     let mut current_doi: Option<String> = None;
-    let mut records_for_current_doi: Vec<InputRecord> = Vec::new();
+    let mut records_for_current_work: Vec<InputRecord> = Vec::new();
     let mut total_records_written = 0;
-    let mut total_dois_processed = 0;
+    let mut total_works_processed = 0;
 
     for (i, result) in rdr.deserialize::<InputRecord>().enumerate() {
         let record = match result {
@@ -473,25 +596,27 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         };
 
-        if current_doi.is_some() && current_doi.as_ref().unwrap() != &record.doi {
-            let doi_to_process = current_doi.clone().unwrap();
+        if current_work_id.is_some() && current_work_id.as_ref().unwrap() != &record.work_id {
+            let work_id_to_process = current_work_id.clone().unwrap();
+            let doi_to_process = current_doi.clone();
             
-            let written_count = process_doi_group(&doi_to_process, &records_for_current_doi, &mut wtr)?;
+            let written_count = process_work_group(&work_id_to_process, &doi_to_process, &records_for_current_work, &mut wtr)?;
             total_records_written += written_count;
-            total_dois_processed += 1;
+            total_works_processed += 1;
             
-            records_for_current_doi.clear();
+            records_for_current_work.clear();
         }
 
-        current_doi = Some(record.doi.clone());
-        records_for_current_doi.push(record);
+        current_work_id = Some(record.work_id.clone());
+        current_doi = record.doi.clone();
+        records_for_current_work.push(record);
     }
 
-    if let Some(doi) = current_doi {
-        if !records_for_current_doi.is_empty() {
-            let written_count = process_doi_group(&doi, &records_for_current_doi, &mut wtr)?;
+    if let Some(work_id) = current_work_id {
+        if !records_for_current_work.is_empty() {
+            let written_count = process_work_group(&work_id, &current_doi, &records_for_current_work, &mut wtr)?;
             total_records_written += written_count;
-            total_dois_processed += 1;
+            total_works_processed += 1;
         }
     }
 
@@ -499,8 +624,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     wtr.flush()?;
 
     info!(
-        "Streaming process complete in {:.2?}. Processed {} unique DOIs and wrote {} records.",
-        process_start_time.elapsed(), total_dois_processed, total_records_written
+        "Streaming process complete in {:.2?}. Processed {} unique work IDs and wrote {} records.",
+        process_start_time.elapsed(), total_works_processed, total_records_written
     );
     info!(
         "Total time for all operations: {:.2?}",
