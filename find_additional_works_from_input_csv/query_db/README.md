@@ -12,7 +12,7 @@ pip install -r requirements.txt
 
 ### Process works and find author-affiliation linkages
 ```bash
-python query_db.py --process-file \
+python -m query_db --process-file \
   --input-file input.csv \
   --output-file results.csv \
   --db-file publications.duckdb \
@@ -23,20 +23,21 @@ Generates:
 - `results_linkage.csv`: Author-affiliation mappings
 - `results_full_discovery_log.csv`: All discovered works with linking details
 - `results_discovered_works.csv`: Deduplicated list of related works
+- `results_entity_mappings.csv`: Extracted organizational entities (when entity extraction is enabled)
 
 ### Search works by affiliation
 ```bash
-python query_db.py --search-affiliation \
+python -m query_db --search-affiliation \
   --input-file affiliations.csv \
   --output-file works.csv \
   --db-file publications.duckdb \
   --config config.yaml
 ```
 
-### Discover works via shared affiliations from DOIs
+### Discover works via shared affiliations from IDs (DOIs or Work IDs)
 ```bash
-python query_db.py --doi-search \
-  --input-file dois.csv \
+python -m query_db --id-search \
+  --input-file ids.csv \
   --output-file results.csv \
   --db-file publications.duckdb \
   --config config.yaml
@@ -45,7 +46,7 @@ python query_db.py --doi-search \
 Generates:
 - `results_discovered_works.csv`: New works found via shared affiliations
 - `results_linking_affiliations.csv`: Affiliations used for discovery
-- `results_unmatched_dois.csv`: Input DOIs without matching organization affiliations
+- `results_unmatched_ids.csv`: Input IDs without matching organization affiliations
 
 
 ## Configuration
@@ -61,16 +62,18 @@ Create a `config.yaml` file to specify your input file format and its processing
 # ----------------------------------------------------
 input_columns:
   doi: "DOI"                        # Column containing DOI identifiers
-  authors: "Authors"    # Column containing author names
+  work_id: "Work ID"                # Column containing Work IDs (optional, alternative to DOI)
+  authors: "Authors"                # Column containing author names
   author_separator: ";"             # Delimiter to use if multiple authors are in one field
 
 # ----------------------------------------------------
-# 2. Author Name Normalization(Required)
+# 2. Author Name Normalization (Required)
 #    Specify the format of names in both reference and input files.
 #    The tool will normalize names to match between datasets.
 # ----------------------------------------------------
 reference_name_style: "first last"  # Format in reference database
 input_name_style: "last f"          # Format in your input CSV
+name_matching_threshold: 0.85       # Similarity threshold for fuzzy name matching (0-1)
 
 # Supported name styles:
 # - "first last":  "John Smith" → normalized to "smith j"
@@ -81,7 +84,7 @@ input_name_style: "last f"          # Format in your input CSV
 # - "last":        "Smith" → normalized to "smith"
 
 # ----------------------------------------------------
-# 3. Affiliation Disambiguation(Optional)
+# 3. Affiliation Disambiguation (Optional)
 #    When an author has multiple affiliations, prioritize
 #    affiliations containing these organization names.
 # ----------------------------------------------------
@@ -99,19 +102,35 @@ affiliation_search_columns:
   affiliation_name: "Institution"   # Column name containing affiliations to search
 
 # ----------------------------------------------------
-# 5. DOI Search Columns (Required for --doi-search mode)
-#    Specifies which column contains DOIs for discovery.
+# 5. ID Search Columns (Required for --id-search mode)
+#    Specifies which columns contain identifiers for discovery.
 # ----------------------------------------------------
-doi_search_columns:
+id_search_columns:
   doi: "DOI"                       # Column name containing DOIs to search
+  work_id: "Work ID"               # Column name containing Work IDs (optional)
+
+# ----------------------------------------------------
+# 6. Entity Extraction Configuration (Optional)
+#    Settings for NLP-based entity extraction and matching.
+# ----------------------------------------------------
+entity_extraction_enabled: true      # Enable entity extraction using Flair NLP
+entity_matching_threshold: 85        # Similarity threshold for entity matching (0-100)
+use_entity_discovery: true           # Enable entity-based work discovery
 ```
+
+### Performance Options
+
+Optional command-line flags for performance tuning:
+- `--memory-limit`: Set memory limit for DuckDB (default: 8GB)
+- `--no-udf`: Disable User-Defined Functions for compatibility (may impact performance)
 
 ### Configuration File Details
 
 #### Input Columns Section
 - doi: The column in your input CSV that contains DOIs
+- work_id: The column containing Work IDs (optional, can be used instead of or alongside DOIs)
 - authors: The column containing author names (can have multiple authors)
-- author_separator: Character(s) used to separate multiple authors, when multiple are in a single cell
+- author_separator: Character(s) used to separate multiple authors in a single cell
 
 #### Name Normalization
 The script normalizes author names to enable matching between different formats:
@@ -130,6 +149,12 @@ When authors have multiple affiliations, the script can prioritize specific name
 - List all variations of your organization name
 - The tool will select affiliations containing these strings first
 - If no match is found, the first available affiliation is used
+
+#### Entity Extraction (Optional)
+Enhances affiliation matching using NLP:
+- `entity_extraction_enabled`: Activates Flair NLP for extracting organizations from affiliation text
+- `entity_matching_threshold`: Controls how similar extracted entities must be (0-100)
+- `use_entity_discovery`: Enables discovering additional works through extracted entities
 
 #### Affiliation Search (Required for search mode)
 Only necessary when using `--search-affiliation` mode:

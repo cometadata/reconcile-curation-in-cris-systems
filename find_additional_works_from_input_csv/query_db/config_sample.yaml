@@ -1,0 +1,76 @@
+# ----------------------------------------------------
+# Configuration for query_db.py - EMBL 2023 dataset
+# ----------------------------------------------------
+
+# ----------------------------------------------------
+# 1. Input File Column Mapping (Required)
+#    Maps your input CSV column names to the script's internal names.
+# ----------------------------------------------------
+input_columns:
+  doi: "DOIs (Digital Object Identifiers)"                        # Column containing DOI identifiers
+  authors: "First name Last name"   # Column containing author names
+  author_separator: ""             # Delimiter to use if multiple authors are in one field
+
+# ----------------------------------------------------
+# 2. Author Name Normalization (Required)
+#    Specify the format of names in both reference and input files.
+#    The tool will normalize names to match between datasets.
+# ----------------------------------------------------
+reference_name_style: "first_last"  # Format in reference database
+input_name_style: "first_last"    # EMBL format: "Lastname Initial" (e.g., "Kreibich E")
+name_matching_threshold: 0.85       # Similarity threshold for name matching (0-1)
+
+# ----------------------------------------------------
+# 3. Affiliation Disambiguation (Optional)
+#    When an author has multiple affiliations, prioritize
+#    affiliations containing these organization names.
+# ----------------------------------------------------
+organization_names:
+  - "Wageningen University & Research"
+  - "Wageningen University and Research"
+  - "Wageningen Universiteit en Researchcentrum"
+  - "Wageningen University and Research Centre"
+  - "Wageningen University and Research Center"
+  - "Wageningen Universiteit"
+  - "Wageningen University"
+  - "Wageningen"
+  - "WUR"
+  - "Rijkslandbouwschool"
+  - "Hoogere Land- en Boschbouwschool"
+  - "Rijks Hoogere Land-, Tuin- en Boschbouwschool"
+  - "Rijks Landbouw Hoogeschool"
+  - "Landbouwuniversiteit Wageningen"
+  - "Wageningen UR"
+  - "University of Wageningen"
+  - "Wageningen Agricultural University"
+
+# ----------------------------------------------------
+# 4. Affiliation Search Columns (Required for --search-affiliation mode)
+#    Specifies which column contains affiliations when searching.
+# ----------------------------------------------------
+affiliation_search_columns:
+  affiliation_name: "Institute"   # Column name containing affiliations to search
+
+# ----------------------------------------------------
+# 5. ID Search Columns (Required for --id-search mode)
+#    Specifies which columns contain identifiers for discovery.
+# ----------------------------------------------------
+id_search_columns:
+  doi: "DOIs (Digital Object Identifiers)"                       # Column name containing DOIs
+  # work_id: not present in EMBL dataset
+
+# ----------------------------------------------------
+# 6. Author-Affiliation Search Columns (Required for --author-affiliation-search mode)
+#    Specifies which columns contain author names and affiliations for searching.
+# ----------------------------------------------------
+author_affiliation_search_columns:
+  author_name: "Person"                # Column containing author names
+  affiliation_name: "Institute"        # Column containing institution/affiliation names
+
+# ----------------------------------------------------
+# 7. Entity Extraction Configuration (Optional)
+#    Settings for Flair NLP entity extraction and matching
+# ----------------------------------------------------
+entity_extraction_enabled: true      # Enable entity extraction using Flair NLP
+entity_matching_threshold: 85        # Similarity threshold for entity matching (0-100)
+use_entity_discovery: true           # Enable entity-based work discovery
