@@ -1,16 +1,19 @@
-# Reconcile curation of DOI metadata in CRIS systems
+# Reconcile Curation in CRIS Systems Pipeline
 
-This is a COMET enrichment and curation workflow pilot project. Go to the [Pilot Projects Overview Board](https://github.com/orgs/cometadata/projects/14) to see all of the pilots.  
+This is the code repository for the COMET enrichment project: 'Leverage Affiliations from CRIS Systems'. Refer to the [Project Hub](https://docs.google.com/document/d/1iihySZjcSqFigW2YC09-zwz4IusCpbY1xluqtxm6d9k/edit?usp=sharing) for a full description of the project and information on getting involved.
 
-## Objective
+## Description of Pipeline
 
-Leverage data from institutional Current Research Information Systems (CRIS) to enhance metadata, primarily by identifying institutional works and improving the accuracy and completeness of affiliation metadata through ROR ID assignment.
+The pipeline begins by processing an OpenAlex works data snapshot using the [openalex-fast-field-parse utility](https://github.com/cometadata/reconcile-curation-in-cris-systems/tree/main/parsing-utils/openalex-fast-field-parse). Here, we extract the metadata fields necessary for analysis and reconciliation (e.g. `authorships.author.display_name`, `authorships.institutions.display_name`, and `doi`) from the gzipped JSONL files and output in CSV format.
 
-## Getting Involved 
+This raw, field-level CSV is then fed into the [parse_join_normalize_author_affiliation_metadata utility](https://github.com/cometadata/reconcile-curation-in-cris-systems/tree/main/parsing-utils/parse_join_normalize_author_affiliation_metadata). This processes the input, aggregating and normalizing the various fields into coherent entries where authors and affiliations are linked, outputting the results as a new CSV file.
 
-COMET is in the process of setting up a Github space for ideas and feedback from the COMET community. In the meantime, get involved by: 
-* providing input on the project at [the pilot project epic](https://github.com/cometadata/reconcile-curation-in-cris-systems/issues/4)
-* viewing the project's progress at the [Project Board](https://github.com/orgs/cometadata/projects/10)
-* contributing topics about this pilot by opening an issue in this repo, or
-* contacting COMET's Project Lead, Dione Mentis, at [dione.mentis@datacite.org](mailto:dione.mentis@datacite.org)
+With this clean dataset of author-affiliation metadata, the [build_db.py script](https://github.com/cometadata/reconcile-curation-in-cris-systems/tree/main/find_additional_works_from_input_csv/build_db) is used to create a DuckDB database therefrom. In this database, indexes are created for `doi`, `normalized_full_name`, and `normalized_affiliation_key` columns.
 
+The core analysis is then conducted by the [query_db.py script](https://github.com/cometadata/reconcile-curation-in-cris-systems/tree/main/find_additional_works_from_input_csv/query_db), which operates in one of two modes:
+
+1.  File Processing Mode: This mode is designed to enrich an external list of publications, such as those produced from curation in a CRIS system. It takes as input a CSV containing DOIs and author names and queries the DuckDB database to link each author to their corresponding affiliation data. This linking process is customizable via a `config.yaml` file, which maps the CSV input columns to the database, specifying how to normalize author names to ensure they match between the input and DB. If an author is associated with multiple affiliations, the configuration allows for prioritizing those that contain variant names for the organization. As output, it generates two files:
+    * A `_linkage.csv` file, which details the discovered links between authors and their affiliations.
+    * A `_discovered_works.csv` file, which uses the linked affiliations to find other works in the database by wher an author shares an affiliations that overlaps with those in the linkage file, excluding the original query DOIs.
+
+2. Affiliation Search Mode: Alternatively, we can do a direct search of the database using a list of affiliation names provided in an input CSV. The script queries the database for all works where the `normalized_affiliation_key` matches the provided names, saving the results to an output file.
